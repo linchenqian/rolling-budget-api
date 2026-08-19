@@ -1,0 +1,99 @@
+name: rolling-budget-api
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 60s
+
+  migrate:
+    build:
+      context: .
+    image: rolling-budget-api:local
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - backend
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  api:
+    build:
+      context: .
+    image: rolling-budget-api:local
+    restart: unless-stopped
+    init: true
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      API_KEY: ${API_KEY:-}
+      AUTO_MIGRATE: "0"
+      BUDGET_ADMIN_API_KEY: ${BUDGET_ADMIN_API_KEY:-}
+      BUDGET_READ_API_KEY: ${BUDGET_READ_API_KEY:-}
+      BUDGET_WRITE_API_KEY: ${BUDGET_WRITE_API_KEY:-}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-*}
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "${API_BIND_ADDRESS:-127.0.0.1}:${API_PORT:-8080}:8000"
+    networks:
+      - backend
+      - frontend
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3).read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+networks:
+  backend:
+    internal: true
+  frontend:
+
+volumes:
+  postgres_data:

@@ -1,0 +1,91 @@
+name: rolling-budget-api
+
+# Before installing:
+# 1. Replace YOUR_POOL in every host path.
+# 2. Replace OWNER and pin the API image to a released tag or digest.
+# 3. Create postgres.env and app.env as described in README.md.
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    env_file:
+      - /mnt/YOUR_POOL/appdata/rolling-budget-api/config/postgres.env
+    volumes:
+      - type: bind
+        source: /mnt/YOUR_POOL/appdata/rolling-budget-api/postgres
+        target: /var/lib/postgresql/data
+      - type: bind
+        source: /mnt/YOUR_POOL/appdata/rolling-budget-api/backups
+        target: /backups
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 60s
+
+  migrate:
+    image: ghcr.io/OWNER/rolling-budget-api:latest
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    env_file:
+      - /mnt/YOUR_POOL/appdata/rolling-budget-api/config/app.env
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - backend
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  api:
+    image: ghcr.io/OWNER/rolling-budget-api:latest
+    restart: unless-stopped
+    init: true
+    env_file:
+      - /mnt/YOUR_POOL/appdata/rolling-budget-api/config/app.env
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      # Loopback is safest. Replace 127.0.0.1 with the exact TrueNAS LAN IP
+      # only if the dashboard runs on another host.
+      - "127.0.0.1:18080:8000"
+    networks:
+      - backend
+      - frontend
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3).read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+networks:
+  backend:
+    internal: true
+  frontend:

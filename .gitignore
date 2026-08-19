@@ -1,0 +1,53 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+secrets/
+
+# Python
+.venv/
+venv/
+node_modules/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Runtime data, database files, logs, imports, exports, and backups
+data/
+pgdata/
+backups/
+exports/
+imports/
+logs/
+*.db
+*.sqlite*
+*.dump
+*.bak
+*.sql
+
+# Financial data must never enter this repository
+*.ofx
+*.qfx
+*.qbo
+financial_transactions*.json
+posted_transactions*.json
+classification*_result*.json
+tests/fixtures/private/

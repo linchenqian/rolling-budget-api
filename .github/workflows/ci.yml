@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: budget_test
+          POSTGRES_USER: budget_test
+          POSTGRES_PASSWORD: budget_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U budget_test -d budget_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+psycopg://budget_test:budget_test@127.0.0.1:5432/budget_test
+      BUDGET_READ_API_KEY: test-read-key-at-least-32-characters
+      BUDGET_WRITE_API_KEY: test-write-key-at-least-32-characters
+      BUDGET_ADMIN_API_KEY: test-admin-key-at-least-32-characters
+      BUDGET_TIMEZONE: America/New_York
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Lint
+        run: python -m ruff check src tests
+
+      - name: Type check
+        run: python -m mypy src
+
+      - name: Apply migrations
+        run: python -m alembic upgrade head
+
+      - name: Test
+        run: python -m pytest -q
+
+      - name: Build image
+        run: docker build --tag rolling-budget-api:test .
