@@ -30,7 +30,7 @@ Tag:        0.3
 ```
 
 The `0.3` minor channel receives `0.3.x` image updates through TrueNAS's built-in
-Docker update check. Use a fixed patch tag such as `0.3.0` instead when automatic
+Docker update check. Use a fixed patch tag such as `0.3.1` instead when automatic
 update notifications are not wanted. Do not use `latest`.
 
 ## 2. Open the guided wizard
