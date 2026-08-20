@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rolling-budget-api"
-version = "0.2.1"
+version = "0.3.0"
 description = "A small, integrity-first rolling budget API for personal dashboards."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -13,15 +13,17 @@ authors = [{ name = "rolling-budget-api contributors" }]
 dependencies = [
   "alembic>=1.14,<2",
   "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "mcp>=1.29,<2",
   "psycopg[binary]>=3.2,<4",
   "pydantic-settings>=2.7,<3",
+  "python-multipart>=0.0.20,<1",
   "sqlalchemy>=2.0,<3",
   "uvicorn[standard]>=0.34,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "httpx>=0.28,<1",
   "mypy>=1.14,<2",
   "pytest>=8.3,<9",
   "pytest-cov>=6,<7",

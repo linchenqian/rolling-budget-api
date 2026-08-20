@@ -10,8 +10,8 @@ real transaction fixtures.
 
 ## Status
 
-Early MVP. Treat the API and migration history as pre-release until the first
-versioned image is published.
+Personal MVP. Releases publish multi-architecture container images, but the API
+and database migration history should still be treated as pre-1.0 interfaces.
 
 ## Behavior
 
@@ -33,8 +33,9 @@ versioned image is published.
 ## Architecture and trust boundaries
 
 ```text
-AI uploader ------API key------> API ----> SQLite / PostgreSQL
-Existing dashboard --API key----> API
+ChatGPT --OAuth 2.1 / MCP-------> API ----> SQLite / PostgreSQL
+Local uploader ------API key----> API
+Existing dashboard ---API key---> API
 ```
 
 The API, not the dashboard, calculates rolling dates, refund adjustments, and
@@ -46,6 +47,17 @@ Browser CORS is open by default, but every protected endpoint still requires a
 Bearer API key. Do not embed the master key in public JavaScript: put the API
 behind HTTPS and let the dashboard call it through a server-side proxy, or
 configure a separate revocable read-only key.
+
+Setting `PUBLIC_BASE_URL` enables a Streamable HTTP MCP endpoint at `/mcp` for
+ChatGPT. The remote MCP uses OAuth authorization-code flow with PKCE and issues
+only `budget:read` and `budget:refresh` scopes; it never gives ChatGPT the
+master API key or permission to change configuration. OAuth credentials are
+opaque, stored only as keyed digests, and remain valid across container
+restarts. The owner approves the initial link on a private consent page using
+the master key or an optional separate `OAUTH_CONSENT_SECRET`. Deployments that
+use only role-specific API keys must configure the separate consent secret. The
+container needs outbound HTTPS access to `chatgpt.com` to validate ChatGPT's
+client metadata during authorization.
 
 ## Refresh integrity protocol
 
@@ -124,6 +136,12 @@ the credential is not embedded in the JavaScript bundle.
 | `MAX_BATCH_ITEMS` | Maximum transactions accepted in one upload batch; default `250` |
 | `MAX_REQUEST_BYTES` | Maximum declared HTTP request size; default `262144` bytes |
 | `STALE_AFTER_HOURS` | Age after which dashboard freshness is reported stale; default `36` |
+| `PUBLIC_BASE_URL` | Public HTTPS origin that enables ChatGPT OAuth and `/mcp`; omit to disable remote MCP |
+| `OAUTH_CONSENT_SECRET` | Optional owner-only consent password; defaults to `API_KEY`, and is required in role-key-only mode |
+| `OAUTH_AUTHORIZATION_CODE_TTL_SECONDS` | Authorization-code lifetime; default `300` |
+| `OAUTH_ACCESS_TOKEN_TTL_SECONDS` | MCP access-token lifetime; default `900` |
+| `OAUTH_REFRESH_TOKEN_TTL_SECONDS` | Rotating refresh-token lifetime; default `7776000` |
+| `MCP_MAX_REQUEST_BYTES` | MCP JSON-RPC envelope limit; default `524288` bytes |
 
 For backward compatibility, an existing deployment may omit `API_KEY` only when
 all three role-specific keys are configured. Every configured key must be unique
@@ -141,8 +159,10 @@ complete UI fields, domain setup, backup notes, and the optional PostgreSQL YAML
 path are in [`deploy/truenas/README.md`](deploy/truenas/README.md).
 
 Publishing a GitHub Release runs the included workflow to build provenance and
-SBOM-enabled `linux/amd64` and `linux/arm64` images in GHCR. Pin the
-tested release tag or digest in the TrueNAS YAML instead of deploying `latest`.
+SBOM-enabled `linux/amd64` and `linux/arm64` images in GHCR. A fixed patch tag
+provides reproducible installs; a minor channel tag such as `0.3` lets a Guided
+Custom App use TrueNAS's built-in Docker image update detection for later
+`0.3.x` releases without following `latest` across feature lines.
 
 ## Privacy and logs
 

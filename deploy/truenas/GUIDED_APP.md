@@ -26,11 +26,12 @@ Use these image fields only after that release exists:
 
 ```text
 Repository: ghcr.io/YOUR_GITHUB_USERNAME/rolling-budget-api
-Tag:        <GUIDED_RELEASE_TAG>
+Tag:        0.3
 ```
 
-Replace `<GUIDED_RELEASE_TAG>` with the real fixed release tag, for example
-`0.2.1`. Do not type the placeholder into TrueNAS and do not use `latest`.
+The `0.3` minor channel receives `0.3.x` image updates through TrueNAS's built-in
+Docker update check. Use a fixed patch tag such as `0.3.0` instead when automatic
+update notifications are not wanted. Do not use `latest`.
 
 ## 2. Open the guided wizard
 
@@ -51,7 +52,7 @@ Install Custom App form. Do not select **Install via YAML** for this path.
 | Field | Value |
 | --- | --- |
 | Repository | `ghcr.io/YOUR_GITHUB_USERNAME/rolling-budget-api` |
-| Tag | The fixed Guided App release tag |
+| Tag | `0.3` for built-in `0.3.x` update detection, or a fixed patch tag |
 | Pull Policy | Only pull image if not present on host |
 
 ### Container Configuration
@@ -72,6 +73,16 @@ Add one required environment variable:
 | --- | --- |
 | `API_KEY` | A unique random secret of at least 32 characters |
 
+To connect ChatGPT, add one more environment variable:
+
+| Name | Value |
+| --- | --- |
+| `PUBLIC_BASE_URL` | Your public HTTPS origin, for example `https://budget.example.com` |
+
+Do not append `/mcp` or a trailing slash. The service derives the MCP resource,
+OAuth endpoints, issuer, and token audience from this exact origin. Omitting
+`PUBLIC_BASE_URL` leaves the REST API enabled but disables remote MCP/OAuth.
+
 Generate this key in a password manager or with `openssl rand -hex 32`. Do not
 reuse a bank, GitHub, OpenAI, TrueNAS, or Wi-Fi credential, and do not paste the
 key into source control or chat.
@@ -89,6 +100,11 @@ No other environment variable is required. The image supplies these defaults:
 | `MAX_BATCH_ITEMS` | `250` |
 | `MAX_REQUEST_BYTES` | `262144` |
 | `STALE_AFTER_HOURS` | `36` |
+| `MCP_MAX_REQUEST_BYTES` | `524288` |
+| `OAUTH_CONSENT_SECRET` | Uses `API_KEY` when empty; required in advanced role-key-only mode |
+| `OAUTH_AUTHORIZATION_CODE_TTL_SECONDS` | `300` |
+| `OAUTH_ACCESS_TOKEN_TTL_SECONDS` | `900` |
+| `OAUTH_REFRESH_TOKEN_TTL_SECONDS` | `7776000` |
 
 The CORS default allows a browser page from any origin to call the API, but it
 does not bypass bearer authentication. Once the dashboard browser origin
@@ -187,9 +203,10 @@ Create DNS and TLS outside the Guided Custom App form:
 2. Obtain a valid certificate for `budget.example.com`.
 3. Configure the reverse proxy upstream as
    `http://TRUENAS_LAN_IP:18080`.
-4. Preserve the `Authorization` header and allow `OPTIONS` requests.
-5. Disable caching for `/v1/*` and health endpoints.
-6. Expose only HTTPS port 443; keep port 18080 private to the LAN/proxy.
+4. Preserve `Authorization`, `Mcp-Protocol-Version`, and `Mcp-Session-Id` headers.
+5. Allow `GET`, `POST`, `PUT`, `DELETE`, and `OPTIONS` as forwarded methods.
+6. Disable caching for `/v1/*`, `/mcp`, `/.well-known/*`, `/oauth/*`, and health endpoints.
+7. Expose only HTTPS port 443; keep port 18080 private to the LAN/proxy.
 
 Verify the public TLS route without an API key:
 
@@ -208,7 +225,27 @@ Never put that key in a URL query parameter. If a public browser bundle embeds
 it, anyone who can load the page can extract it; the safer dashboard
 integration keeps the key in its server-side proxy.
 
-## 6. Protect the ixVolume
+The ChatGPT MCP endpoint does not accept `API_KEY` as a bearer token. During the
+one-time OAuth link, enter `OAUTH_CONSENT_SECRET` when configured, otherwise
+enter `API_KEY`, only into the service's own HTTPS consent page. ChatGPT receives
+limited, revocable OAuth tokens instead. The container also needs outbound DNS
+and HTTPS access to `chatgpt.com` so it can validate ChatGPT's client metadata.
+
+## 6. Use TrueNAS image updates
+
+Keep **Apps → Settings → Check for Docker image updates** enabled. When the
+configured `0.3` channel digest changes, the app can show **Update Available**.
+Clicking Update pulls the new image and recreates the container while retaining
+the `/data` mount. Keep the default pull policy; it does not need to be changed
+to Always.
+
+Before clicking Update, snapshot or back up the ixVolume. A Custom App
+image-only update does not guarantee the same automatic rollback snapshot as a
+catalog application upgrade. To return to an earlier image, edit the app to a
+known fixed patch tag and redeploy, then restore the database only if its schema
+also needs to move backward.
+
+## 7. Protect the ixVolume
 
 TrueNAS recommends ixVolumes mainly for testing and Host Path storage for
 long-lived production data. This deployment accepts ixVolume for simplicity, so
