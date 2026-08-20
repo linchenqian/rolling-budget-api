@@ -22,7 +22,7 @@ decision:
 | Setting | Value |
 | --- | --- |
 | Image repository | `ghcr.io/YOUR_GITHUB_USERNAME/rolling-budget-api` |
-| Image tag | Minor update channel `0.3`, or a fixed patch release such as `0.3.0` |
+| Image tag | Minor update channel `0.3`, or a fixed patch release such as `0.3.1` |
 | Required environment variable | `API_KEY=<one long random secret>` |
 | ChatGPT MCP environment variable | `PUBLIC_BASE_URL=https://budget.example.com` |
 | Container/host port | `8000` → `18080/TCP` |

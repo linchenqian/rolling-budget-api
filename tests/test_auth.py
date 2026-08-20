@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from rolling_budget_api.core.auth import require_admin, require_read, require_write
 from rolling_budget_api.core.config import Settings, get_settings
+from rolling_budget_api.oauth.config import OAuthConfig
 
 MASTER_KEY = "synthetic-master-key-at-least-32-characters"
 READ_KEY = "synthetic-read-key-at-least-32-characters"
@@ -106,6 +107,7 @@ def test_only_master_key_is_required_and_other_settings_have_defaults(
     assert settings.stale_after_hours == 36
     assert settings.public_base_url is None
     assert settings.mcp_public_url is None
+    assert settings.oauth_form_action_origins == ["https://chatgpt.com"]
 
 
 def test_public_base_url_enables_a_canonical_mcp_resource() -> None:
@@ -114,6 +116,34 @@ def test_public_base_url_enables_a_canonical_mcp_resource() -> None:
     assert settings.public_base_url == "https://budget.example.com"
     assert settings.mcp_public_url == "https://budget.example.com/mcp"
     assert settings.oauth_owner_secret == MASTER_KEY
+
+
+def test_oauth_form_action_origins_are_configurable_and_normalized() -> None:
+    settings = _settings(
+        PUBLIC_BASE_URL="https://budget.example.com",
+        OAUTH_FORM_ACTION_ORIGINS=(
+            "https://chatgpt.com/, https://callbacks.example.com:8443, "
+            "https://chatgpt.com"
+        ),
+    )
+
+    assert settings.oauth_form_action_origins == [
+        "https://chatgpt.com",
+        "https://callbacks.example.com:8443",
+    ]
+    assert OAuthConfig.from_settings(settings).form_action_origins == (
+        "https://chatgpt.com",
+        "https://callbacks.example.com:8443",
+    )
+
+
+@pytest.mark.parametrize(
+    "origins",
+    ["*", "http://chatgpt.com", "https://chatgpt.com/path", ""],
+)
+def test_oauth_form_action_origins_reject_unsafe_values(origins: str) -> None:
+    with pytest.raises(ValidationError, match="OAUTH_FORM_ACTION_ORIGINS"):
+        _settings(OAUTH_FORM_ACTION_ORIGINS=origins)
 
 
 @pytest.mark.parametrize(

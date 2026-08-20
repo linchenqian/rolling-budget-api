@@ -55,6 +55,10 @@ class Settings(BaseSettings):
         alias="OAUTH_CONSENT_SECRET",
         min_length=24,
     )
+    oauth_form_action_origins: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["https://chatgpt.com"],
+        alias="OAUTH_FORM_ACTION_ORIGINS",
+    )
     oauth_authorization_code_ttl_seconds: int = Field(
         default=300,
         ge=60,
@@ -80,7 +84,7 @@ class Settings(BaseSettings):
         alias="MCP_MAX_REQUEST_BYTES",
     )
 
-    @field_validator("cors_allowed_origins", mode="before")
+    @field_validator("cors_allowed_origins", "oauth_form_action_origins", mode="before")
     @classmethod
     def split_origins(cls, value: object) -> object:
         if isinstance(value, str):
@@ -93,6 +97,31 @@ class Settings(BaseSettings):
         if "*" in value and len(value) != 1:
             raise ValueError("CORS_ALLOWED_ORIGINS cannot mix '*' with exact origins")
         return value
+
+    @field_validator("oauth_form_action_origins")
+    @classmethod
+    def validate_oauth_form_action_origins(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError("OAUTH_FORM_ACTION_ORIGINS must contain at least one HTTPS origin")
+        normalized: list[str] = []
+        for origin in value:
+            parsed = urlsplit(origin.strip())
+            if (
+                parsed.scheme != "https"
+                or not parsed.netloc
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(
+                    "OAUTH_FORM_ACTION_ORIGINS must contain exact HTTPS origins"
+                )
+            exact_origin = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+            if exact_origin not in normalized:
+                normalized.append(exact_origin)
+        return normalized
 
     @field_validator("public_base_url")
     @classmethod

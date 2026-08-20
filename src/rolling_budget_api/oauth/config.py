@@ -21,6 +21,7 @@ _CALLBACK_REDIRECT_RE = re.compile(
 class OAuthSettingsLike(Protocol):
     public_base_url: str | None
     oauth_consent_secret: str | None
+    oauth_form_action_origins: list[str]
     api_key: str | None
     oauth_authorization_code_ttl_seconds: int
     oauth_access_token_ttl_seconds: int
@@ -31,6 +32,7 @@ class OAuthSettingsLike(Protocol):
 class OAuthConfig:
     public_base_url: str
     consent_secrets: tuple[str, ...] = field(repr=False)
+    form_action_origins: tuple[str, ...] = ("https://chatgpt.com",)
     authorization_code_ttl_seconds: int = 300
     access_token_ttl_seconds: int = 900
     refresh_token_ttl_seconds: int = 7_776_000
@@ -61,6 +63,32 @@ class OAuthConfig:
             raise ValueError("At least one owner consent secret of 24 characters is required")
         object.__setattr__(self, "consent_secrets", unique_secrets)
 
+        normalized_form_action_origins: list[str] = []
+        for origin in self.form_action_origins:
+            origin_parts = urlsplit(origin.strip())
+            if (
+                origin_parts.scheme != "https"
+                or not origin_parts.netloc
+                or origin_parts.username is not None
+                or origin_parts.password is not None
+                or origin_parts.path not in {"", "/"}
+                or origin_parts.query
+                or origin_parts.fragment
+            ):
+                raise ValueError("OAuth form actions require exact HTTPS origins")
+            exact_origin = urlunsplit(
+                (origin_parts.scheme, origin_parts.netloc, "", "", "")
+            )
+            if exact_origin not in normalized_form_action_origins:
+                normalized_form_action_origins.append(exact_origin)
+        if not normalized_form_action_origins:
+            raise ValueError("At least one OAuth form-action origin is required")
+        object.__setattr__(
+            self,
+            "form_action_origins",
+            tuple(normalized_form_action_origins),
+        )
+
         if not 60 <= self.authorization_code_ttl_seconds <= 900:
             raise ValueError("Authorization-code TTL must be between 60 and 900 seconds")
         if not 300 <= self.access_token_ttl_seconds <= 86_400:
@@ -80,6 +108,7 @@ class OAuthConfig:
         return cls(
             public_base_url=settings.public_base_url,
             consent_secrets=(primary,),
+            form_action_origins=tuple(settings.oauth_form_action_origins),
             authorization_code_ttl_seconds=settings.oauth_authorization_code_ttl_seconds,
             access_token_ttl_seconds=settings.oauth_access_token_ttl_seconds,
             refresh_token_ttl_seconds=settings.oauth_refresh_token_ttl_seconds,
