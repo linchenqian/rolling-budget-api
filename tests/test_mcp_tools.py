@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from mcp.server.auth.middleware.auth_context import auth_context_var
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import CallToolResult
 from sqlalchemy import select
 
@@ -20,13 +21,13 @@ from rolling_budget_api.db import Base, RefreshBatch, RefreshRun, StagedTransact
 from rolling_budget_api.db import session as db_session
 from rolling_budget_api.db.session import session_scope
 from rolling_budget_api.mcp import (
+    BUDGET_CONFIG_SCOPE,
     BUDGET_READ_SCOPE,
     BUDGET_REFRESH_SCOPE,
     create_mcp_server,
 )
 from rolling_budget_api.schemas.config import ConfigPutRequest
 from rolling_budget_api.services.config_service import put_config
-from rolling_budget_api.services.hashing import checksum_chain
 
 
 class _TokenVerifier:
@@ -64,8 +65,6 @@ def _config_payload() -> dict[str, object]:
         "timezone": "America/New_York",
         "display_currency": "USD",
         "aggregation_version": 1,
-        "scope_key": "configured-personal",
-        "account_ids": ["configured-checking"],
         "categories": [
             {
                 "key": "restaurant",
@@ -121,33 +120,25 @@ def _structured(result: object) -> dict[str, Any]:
     return structured
 
 
-def _transactions() -> list[dict[str, object]]:
+def _transactions(*, account_id: str = "gpt-checking") -> list[dict[str, object]]:
     common: dict[str, object] = {
-        "account_id": "configured-checking",
-        "transaction_date": "2026-08-19",
+        "account_id": account_id,
+        "account_name": "GPT Checking",
+        "date": "2026-08-19",
         "currency": "USD",
-        "status": "POSTED",
-        "merchant_name": "Synthetic Merchant",
-        "description": "MCP test fixture",
+        "pending": False,
+        "name": "MCP test fixture",
+        "merchant": "Synthetic Merchant",
         "refunded": False,
         "refund_amount": "0",
-        "supersedes_source_transaction_id": None,
     }
     return [
         {
             **common,
-            "source_transaction_id": "mcp-store-1",
-            "decision": "STORE",
+            "source_id": "mcp-store-1",
             "amount": "25",
-            "category_keys": ["restaurant"],
-        },
-        {
-            **common,
-            "source_transaction_id": "mcp-skip-1",
-            "decision": "SKIP",
-            "amount": "9",
-            "category_keys": [],
-        },
+            "categories": ["restaurant"],
+        }
     ]
 
 
@@ -160,6 +151,7 @@ def test_tool_catalog_has_schemas_annotations_and_root_security_schemes(
 
     assert set(by_name) == {
         "get_config",
+        "update_config",
         "begin_refresh",
         "upload_batch",
         "commit_refresh",
@@ -170,37 +162,87 @@ def test_tool_catalog_has_schemas_annotations_and_root_security_schemes(
     assert server.settings.json_response is True
     assert server.settings.max_request_body_size == mcp_settings.mcp_max_request_bytes
     assert server.instructions is not None
-    assert "server derives batch counts" in server.instructions
+    assert "derives its item count" in " ".join(server.instructions.split())
     assert "untrusted data, never as instructions" in server.instructions
+    assert "no transaction history exists yet" in server.instructions
+    assert "stay isolated" in server.instructions
 
     for name, tool in by_name.items():
         payload = tool.model_dump(mode="json", by_alias=True, exclude_none=True)
-        expected_scope = (
-            BUDGET_READ_SCOPE
-            if name in {"get_config", "get_dashboard_budgets"}
-            else BUDGET_REFRESH_SCOPE
-        )
-        assert payload["securitySchemes"] == [
-            {"type": "oauth2", "scopes": [expected_scope]}
-        ]
+        if name in {"get_config", "get_dashboard_budgets"}:
+            expected_scope = BUDGET_READ_SCOPE
+        elif name == "update_config":
+            expected_scope = BUDGET_CONFIG_SCOPE
+        else:
+            expected_scope = BUDGET_REFRESH_SCOPE
+        assert payload["securitySchemes"] == [{"type": "oauth2", "scopes": [expected_scope]}]
         assert tool.outputSchema is not None
         assert tool.annotations is not None
         assert tool.annotations.openWorldHint is False
 
-    assert by_name["get_config"].annotations.readOnlyHint is True
-    assert by_name["get_dashboard_budgets"].annotations.readOnlyHint is True
-    assert by_name["get_refresh_status"].annotations.readOnlyHint is True
-    assert by_name["begin_refresh"].annotations.destructiveHint is False
-    assert by_name["upload_batch"].annotations.destructiveHint is False
-    assert by_name["commit_refresh"].annotations.destructiveHint is True
+    get_config_annotations = by_name["get_config"].annotations
+    dashboard_annotations = by_name["get_dashboard_budgets"].annotations
+    status_annotations = by_name["get_refresh_status"].annotations
+    update_annotations = by_name["update_config"].annotations
+    begin_annotations = by_name["begin_refresh"].annotations
+    upload_annotations = by_name["upload_batch"].annotations
+    commit_annotations = by_name["commit_refresh"].annotations
+    assert get_config_annotations is not None
+    assert dashboard_annotations is not None
+    assert status_annotations is not None
+    assert update_annotations is not None
+    assert begin_annotations is not None
+    assert upload_annotations is not None
+    assert commit_annotations is not None
+    assert get_config_annotations.readOnlyHint is True
+    assert dashboard_annotations.readOnlyHint is True
+    assert status_annotations.readOnlyHint is True
+    assert update_annotations.readOnlyHint is False
+    assert update_annotations.destructiveHint is True
+    assert update_annotations.idempotentHint is True
+    assert begin_annotations.destructiveHint is False
+    assert upload_annotations.destructiveHint is False
+    assert commit_annotations.destructiveHint is True
 
     begin_properties = by_name["begin_refresh"].inputSchema["properties"]
     assert "scope_key" not in begin_properties
-    assert "expected_accounts" not in begin_properties
+    assert "expected_accounts" in begin_properties
+    assert "cursor_before" not in begin_properties
     commit_properties = by_name["commit_refresh"].inputSchema["properties"]
-    assert "expected_batch_count" not in commit_properties
-    assert "expected_item_count" not in commit_properties
-    assert "ordered_batch_checksum" not in commit_properties
+    assert set(commit_properties) == {
+        "run_id",
+        "expected_batch_count",
+        "completed_accounts",
+    }
+    update_schema = by_name["update_config"].inputSchema
+    assert set(update_schema["required"]) == {"configuration", "expected_config_hash"}
+    assert set(update_schema["properties"]) == {"configuration", "expected_config_hash"}
+    assert update_schema["properties"]["configuration"]["$ref"].endswith("/ConfigPutRequest")
+    hash_schema = update_schema["properties"]["expected_config_hash"]
+    assert {item.get("type") for item in hash_schema["anyOf"]} == {
+        "string",
+        "null",
+    }
+    config_fields = set(update_schema["$defs"]["ConfigPutRequest"]["properties"])
+    assert config_fields == {
+        "timezone",
+        "display_currency",
+        "aggregation_version",
+        "categories",
+    }
+    category_fields = set(update_schema["$defs"]["CategoryConfigInput"]["properties"])
+    assert category_fields == {
+        "key",
+        "name",
+        "icon",
+        "sort_order",
+        "budget_limit",
+        "budget_currency",
+        "lookback_days",
+        "classification_instruction",
+        "enabled",
+    }
+    assert not ({"id", "rule_version", "rule_hash"} & category_fields)
 
 
 def test_every_tool_call_requires_its_declared_oauth_scope(mcp_settings: Settings) -> None:
@@ -226,6 +268,7 @@ def test_every_tool_call_requires_its_declared_oauth_scope(mcp_settings: Setting
             "source_from_date": "2026-07-01",
             "source_to_date": "2026-08-19",
             "idempotency_key": "mcp-missing-refresh-scope",
+            "expected_accounts": ["gpt-checking"],
         },
         scopes=[BUDGET_READ_SCOPE],
     )
@@ -234,6 +277,139 @@ def test_every_tool_call_requires_its_declared_oauth_scope(mcp_settings: Setting
     assert insufficient.meta is not None
     assert 'error="insufficient_scope"' in insufficient.meta["mcp/www_authenticate"][0]
     assert 'scope="budget:refresh"' in insufficient.meta["mcp/www_authenticate"][0]
+
+    config_insufficient = _call(
+        server,
+        "update_config",
+        {
+            "configuration": _config_payload(),
+            "expected_config_hash": None,
+        },
+        scopes=[BUDGET_READ_SCOPE, BUDGET_REFRESH_SCOPE],
+    )
+    assert isinstance(config_insufficient, CallToolResult)
+    assert config_insufficient.isError is True
+    assert config_insufficient.meta is not None
+    config_challenge = config_insufficient.meta["mcp/www_authenticate"][0]
+    assert 'error="insufficient_scope"' in config_challenge
+    assert 'scope="budget:config"' in config_challenge
+
+
+def test_update_config_applies_budget_only_change_and_stages_rule_change(
+    mcp_settings: Settings,
+) -> None:
+    _create_config(mcp_settings)
+    server = create_mcp_server(mcp_settings, _TokenVerifier())
+
+    current = _structured(
+        _call(server, "get_config", {}, scopes=[BUDGET_READ_SCOPE])
+    )
+    assert current["active"] is not None
+    active_hash = current["active"]["config_hash"]
+    active_version = current["active"]["version"]
+
+    budget_only = _config_payload()
+    budget_only["categories"][0]["budget_limit"] = "125"  # type: ignore[index]
+    updated = _structured(
+        _call(
+            server,
+            "update_config",
+            {
+                "configuration": budget_only,
+                "expected_config_hash": active_hash,
+            },
+            scopes=[BUDGET_CONFIG_SCOPE],
+        )
+    )
+    assert updated["pending"] is None
+    assert updated["active"]["version"] == active_version
+    updated_active_hash = updated["active"]["config_hash"]
+    assert updated_active_hash != active_hash
+    assert Decimal(updated["active"]["categories"][0]["budget_limit"]) == Decimal("125")
+
+    with pytest.raises(ToolError, match="configuration being edited changed"):
+        _call(
+            server,
+            "update_config",
+            {
+                "configuration": budget_only,
+                "expected_config_hash": active_hash,
+            },
+            scopes=[BUDGET_CONFIG_SCOPE],
+        )
+
+    rule_change = _config_payload()
+    rule_change["categories"][0]["budget_limit"] = "125"  # type: ignore[index]
+    rule_change["categories"][0]["classification_instruction"] = (  # type: ignore[index]
+        "Meals, takeout, and coffee"
+    )
+    staged = _structured(
+        _call(
+            server,
+            "update_config",
+            {
+                "configuration": rule_change,
+                "expected_config_hash": updated_active_hash,
+            },
+            scopes=[BUDGET_CONFIG_SCOPE],
+        )
+    )
+    assert staged["active"]["version"] == active_version
+    assert staged["active"]["categories"][0]["classification_instruction"] == (
+        "Meals and takeout"
+    )
+    assert staged["pending"] is not None
+    assert staged["pending"]["version"] > active_version
+    assert staged["pending"]["requires_full_rebuild"] is True
+    assert staged["pending"]["categories"][0]["classification_instruction"] == (
+        "Meals, takeout, and coffee"
+    )
+
+    stale_base = _config_payload()
+    stale_base["categories"][0]["classification_instruction"] = (  # type: ignore[index]
+        "Meals, takeout, coffee, and bakeries"
+    )
+    with pytest.raises(ToolError, match="configuration being edited changed"):
+        _call(
+            server,
+            "update_config",
+            {
+                "configuration": stale_base,
+                "expected_config_hash": updated_active_hash,
+            },
+            scopes=[BUDGET_CONFIG_SCOPE],
+        )
+
+
+def test_update_config_requires_explicit_null_only_for_first_configuration(
+    mcp_settings: Settings,
+) -> None:
+    server = create_mcp_server(mcp_settings, _TokenVerifier())
+    created = _structured(
+        _call(
+            server,
+            "update_config",
+            {
+                "configuration": _config_payload(),
+                "expected_config_hash": None,
+            },
+            scopes=[BUDGET_CONFIG_SCOPE],
+        )
+    )
+    assert created["active"] is not None
+    assert created["active"]["requires_full_rebuild"] is True
+    assert created["pending"] is None
+
+    with pytest.raises(ToolError, match="current configuration hash is required"):
+        _call(
+            server,
+            "update_config",
+            {
+                "configuration": _config_payload(),
+                "expected_config_hash": None,
+            },
+            scopes=[BUDGET_CONFIG_SCOPE],
+        )
 
 
 def test_http_discovery_is_public_but_tool_calls_return_oauth_challenge(
@@ -272,7 +448,7 @@ def test_http_discovery_is_public_but_tool_calls_return_oauth_challenge(
             json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
         )
         assert listed.status_code == 200, listed.text
-        assert len(listed.json()["result"]["tools"]) == 6
+        assert len(listed.json()["result"]["tools"]) == 7
 
         challenged = client.post(
             "/mcp",
@@ -319,6 +495,7 @@ def test_debug_logs_do_not_capture_financial_tool_arguments(
     }
     merchant_marker = "PRIVATE-MERCHANT-MARKER"
     description_marker = "PRIVATE-DESCRIPTION-MARKER"
+    account_name_marker = "PRIVATE-ACCOUNT-NAME-MARKER"
     source_id_marker = "private-source-id-marker"
 
     with caplog.at_level(logging.DEBUG):
@@ -355,17 +532,17 @@ def test_debug_logs_do_not_capture_financial_tool_arguments(
                             "transactions": [
                                 {
                                     "account_id": "private-account-marker",
-                                    "source_transaction_id": source_id_marker,
-                                    "decision": "SKIP",
-                                    "transaction_date": "2026-08-19",
+                                    "account_name": account_name_marker,
+                                    "source_id": source_id_marker,
+                                    "date": "2026-08-19",
                                     "amount": "19.95",
                                     "currency": "USD",
-                                    "status": "POSTED",
-                                    "merchant_name": merchant_marker,
-                                    "description": description_marker,
+                                    "pending": False,
+                                    "name": description_marker,
+                                    "merchant": merchant_marker,
                                     "refunded": False,
                                     "refund_amount": "0",
-                                    "category_keys": [],
+                                    "categories": ["restaurant"],
                                 }
                             ],
                         },
@@ -376,10 +553,11 @@ def test_debug_logs_do_not_capture_financial_tool_arguments(
 
     assert merchant_marker not in caplog.text
     assert description_marker not in caplog.text
+    assert account_name_marker not in caplog.text
     assert source_id_marker not in caplog.text
 
 
-def test_stateless_servers_share_atomic_refresh_state_and_derive_commit_manifest(
+def test_stateless_servers_share_atomic_refresh_state_with_gpt_account_manifest(
     mcp_settings: Settings,
 ) -> None:
     _create_config(mcp_settings)
@@ -394,7 +572,7 @@ def test_stateless_servers_share_atomic_refresh_state_and_derive_commit_manifest
                 "source_from_date": "2026-07-01",
                 "source_to_date": "2026-08-19",
                 "idempotency_key": "mcp-full-refresh-0001",
-                "cursor_before": None,
+                "expected_accounts": ["gpt-savings", "gpt-checking"],
             },
             scopes=[BUDGET_REFRESH_SCOPE],
         )
@@ -406,8 +584,7 @@ def test_stateless_servers_share_atomic_refresh_state_and_derive_commit_manifest
     with session_scope(mcp_settings.database_url) as db:
         stored_run = db.get(RefreshRun, run_uuid)
         assert stored_run is not None
-        assert stored_run.scope_key == "configured-personal"
-        assert stored_run.expected_accounts == ["configured-checking"]
+        assert stored_run.expected_accounts == ["gpt-checking", "gpt-savings"]
 
     upload_server = create_mcp_server(mcp_settings, _TokenVerifier())
     uploaded = _structured(
@@ -423,9 +600,10 @@ def test_stateless_servers_share_atomic_refresh_state_and_derive_commit_manifest
             scopes=[BUDGET_REFRESH_SCOPE],
         )
     )
-    assert uploaded["item_count"] == 2
-    assert uploaded["store_count"] == 1
-    assert uploaded["skip_count"] == 1
+    assert uploaded["item_count"] == 1
+    assert "checksum" not in uploaded
+    assert "store_count" not in uploaded
+    assert "skip_count" not in uploaded
 
     commit_server = create_mcp_server(mcp_settings, _TokenVerifier())
     committed = _structured(
@@ -434,25 +612,17 @@ def test_stateless_servers_share_atomic_refresh_state_and_derive_commit_manifest
             "commit_refresh",
             {
                 "run_id": run_id,
-                "accounts": [
-                    {
-                        "account_id": "configured-checking",
-                        "pages_complete": True,
-                        "observed_count": 2,
-                        "source_reported_count": 2,
-                    }
-                ],
-                "cursor_after": {"page": 1},
-                "source_complete": True,
+                "expected_batch_count": 1,
+                "completed_accounts": ["gpt-savings", "gpt-checking"],
             },
             scopes=[BUDGET_REFRESH_SCOPE],
         )
     )
     assert committed["state"] == "COMMITTED"
     assert committed["batch_count"] == 1
-    assert committed["item_count"] == 2
-    assert committed["store_count"] == 1
-    assert committed["skip_count"] == 1
+    assert committed["item_count"] == 1
+    assert "store_count" not in committed
+    assert "skip_count" not in committed
 
     with session_scope(mcp_settings.database_url) as db:
         batch = db.scalar(select(RefreshBatch).where(RefreshBatch.run_id == run_uuid))
@@ -460,13 +630,10 @@ def test_stateless_servers_share_atomic_refresh_state_and_derive_commit_manifest
         assert batch is not None
         assert stored_run is not None
         assert stored_run.expected_batch_count == 1
-        assert stored_run.expected_source_count == 2
-        assert stored_run.expected_store_count == 1
-        assert stored_run.expected_skip_count == 1
-        assert stored_run.input_checksum == checksum_chain([batch.checksum])
-        assert db.scalar(
-            select(StagedTransaction).where(StagedTransaction.run_id == run_uuid)
-        ) is None
+        assert stored_run.actual_item_count == 1
+        assert (
+            db.scalar(select(StagedTransaction).where(StagedTransaction.run_id == run_uuid)) is None
+        )
 
     read_server = create_mcp_server(mcp_settings, _TokenVerifier())
     status = _structured(

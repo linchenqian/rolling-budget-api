@@ -4,22 +4,27 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
+from rolling_budget_api.main import create_app
 from rolling_budget_api.schemas.config import CategoryConfigInput, ConfigPutRequest
-from rolling_budget_api.schemas.refresh import RefreshCommitRequest, TransactionUpload
+from rolling_budget_api.schemas.refresh import (
+    RefreshBeginRequest,
+    RefreshCommitRequest,
+    TransactionUpload,
+)
 
 
 def _transaction(**overrides: object) -> dict[str, object]:
     transaction: dict[str, object] = {
         "account_id": "synthetic-checking",
-        "source_transaction_id": "synthetic-tx-001",
-        "decision": "STORE",
-        "transaction_date": date(2026, 8, 19),
+        "account_name": "Everyday Checking",
+        "source_id": "synthetic-tx-001",
+        "date": date(2026, 8, 19),
         "amount": Decimal("42.50"),
         "currency": "USD",
-        "status": "POSTED",
-        "merchant_name": "Synthetic Bistro",
-        "description": "Synthetic fixture only",
-        "category_keys": ["restaurant"],
+        "pending": False,
+        "name": "Synthetic Bistro",
+        "merchant": "Synthetic Bistro",
+        "categories": ["restaurant"],
         "refunded": False,
         "refund_amount": Decimal("0"),
     }
@@ -37,25 +42,17 @@ def _category(key: str) -> CategoryConfigInput:
     )
 
 
-def test_store_requires_categories_and_skip_forbids_them() -> None:
-    with pytest.raises(ValidationError, match="STORE requires"):
-        TransactionUpload.model_validate(_transaction(category_keys=[]))
-
-    with pytest.raises(ValidationError, match="SKIP cannot"):
-        TransactionUpload.model_validate(_transaction(decision="SKIP"))
-
-    skipped = TransactionUpload.model_validate(_transaction(decision="SKIP", category_keys=[]))
-    assert skipped.decision == "SKIP"
+def test_unmatched_transactions_are_omitted_and_upload_requires_categories() -> None:
+    with pytest.raises(ValidationError):
+        TransactionUpload.model_validate(_transaction(categories=[]))
 
 
 def test_multilabel_is_supported_but_duplicate_labels_are_rejected() -> None:
-    multilabel = TransactionUpload.model_validate(
-        _transaction(category_keys=["restaurant", "dating"])
-    )
-    assert multilabel.category_keys == ["restaurant", "dating"]
+    multilabel = TransactionUpload.model_validate(_transaction(categories=["restaurant", "dating"]))
+    assert multilabel.categories == ["dating", "restaurant"]
 
     with pytest.raises(ValidationError, match="cannot contain duplicates"):
-        TransactionUpload.model_validate(_transaction(category_keys=["restaurant", "restaurant"]))
+        TransactionUpload.model_validate(_transaction(categories=["restaurant", "restaurant"]))
 
 
 @pytest.mark.parametrize(
@@ -75,25 +72,95 @@ def test_refund_flags_and_amount_must_agree(
 def test_configuration_rejects_duplicate_category_keys() -> None:
     with pytest.raises(ValidationError, match="category keys must be unique"):
         ConfigPutRequest(
-            account_ids=["synthetic-checking"],
             categories=[_category("restaurant"), _category("restaurant")],
         )
 
 
-def test_commit_counts_must_balance() -> None:
-    with pytest.raises(ValidationError, match=r"store_count \+ skip_count"):
+def test_single_user_configuration_has_no_account_or_named_scope() -> None:
+    request = ConfigPutRequest(categories=[_category("restaurant")])
+
+    assert "account_ids" not in request.model_dump(mode="json")
+    assert "scope_key" not in request.model_dump(mode="json")
+    assert "account_ids" not in ConfigPutRequest.model_json_schema()["properties"]
+    assert "scope_key" not in ConfigPutRequest.model_json_schema()["properties"]
+
+
+def test_source_connector_metadata_is_not_part_of_upload_or_begin_contracts() -> None:
+    begin_properties = RefreshBeginRequest.model_json_schema()["properties"]
+    transaction_properties = TransactionUpload.model_json_schema()["properties"]
+
+    assert "cursor_before" not in begin_properties
+    assert "supersedes_source_transaction_id" not in transaction_properties
+    assert {
+        "decision",
+        "status",
+        "category_keys",
+        "merchant_name",
+        "description",
+        "source_transaction_id",
+        "transaction_date",
+    }.isdisjoint(transaction_properties)
+    assert "pending_source_id" in transaction_properties
+
+
+def test_commit_only_accepts_batch_count_and_completed_accounts() -> None:
+    request = RefreshCommitRequest(
+        expected_batch_count=1,
+        completed_accounts=["synthetic-savings", "synthetic-checking"],
+    )
+
+    assert request.completed_accounts == ["synthetic-checking", "synthetic-savings"]
+    assert set(RefreshCommitRequest.model_json_schema()["properties"]) == {
+        "expected_batch_count",
+        "completed_accounts",
+    }
+
+    with pytest.raises(ValidationError, match="completed_accounts must be unique"):
         RefreshCommitRequest(
             expected_batch_count=1,
-            expected_item_count=3,
-            expected_store_count=1,
-            expected_skip_count=1,
-            ordered_batch_checksum="a" * 64,
-            accounts=[
-                {
-                    "account_id": "synthetic-checking",
-                    "pages_complete": True,
-                    "observed_count": 3,
-                    "source_reported_count": 3,
-                }
-            ],
+            completed_accounts=["synthetic-checking", "synthetic-checking"],
         )
+
+
+def test_openapi_only_exposes_the_simplified_refresh_protocol() -> None:
+    schemas = create_app().openapi()["components"]["schemas"]
+
+    transaction_fields = set(schemas["TransactionUpload"]["properties"])
+    assert transaction_fields == {
+        "source_id",
+        "account_id",
+        "account_name",
+        "date",
+        "amount",
+        "categories",
+        "pending",
+        "pending_source_id",
+        "name",
+        "merchant",
+        "currency",
+        "refunded",
+        "refund_amount",
+    }
+    assert set(schemas["RefreshCommitRequest"]["properties"]) == {
+        "expected_batch_count",
+        "completed_accounts",
+    }
+    assert set(schemas["RefreshBatchResponse"]["properties"]) == {
+        "run_id",
+        "batch_index",
+        "item_count",
+        "replayed",
+    }
+    assert set(schemas["RefreshRunView"]["properties"]) == {
+        "run_id",
+        "state",
+        "mode",
+        "config_version_id",
+        "batch_count",
+        "item_count",
+        "receipt",
+        "created_at",
+        "committed_at",
+        "error_code",
+    }
+    assert "completeness" not in schemas["DashboardFreshness"]["properties"]

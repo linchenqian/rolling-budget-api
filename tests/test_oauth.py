@@ -24,6 +24,7 @@ from rolling_budget_api.db.models import (
 from rolling_budget_api.db.session import get_engine, get_session_factory
 from rolling_budget_api.oauth import DatabaseTokenVerifier, OAuthConfig, create_oauth_router
 from rolling_budget_api.oauth.config import (
+    BUDGET_CONFIG_SCOPE,
     CHATGPT_STABLE_CLIENT_ID,
     CHATGPT_STABLE_REDIRECT_URI,
 )
@@ -149,7 +150,7 @@ def test_metadata_is_cimd_pkce_only_and_uses_exact_mcp_resource(oauth: OAuthHarn
     assert resource.json() == {
         "resource": f"{PUBLIC_BASE_URL}/mcp",
         "authorization_servers": [PUBLIC_BASE_URL],
-        "scopes_supported": ["budget:read", "budget:refresh"],
+        "scopes_supported": ["budget:read", "budget:refresh", "budget:config"],
     }
     assert path_resource.json() == resource.json()
     metadata = server.json()
@@ -159,6 +160,40 @@ def test_metadata_is_cimd_pkce_only_and_uses_exact_mcp_resource(oauth: OAuthHarn
     assert metadata["client_id_metadata_document_supported"] is True
     assert metadata["authorization_response_iss_parameter_supported"] is True
     assert "registration_endpoint" not in metadata
+
+
+def test_config_scope_is_explicitly_consented_and_issued(oauth: OAuthHarness) -> None:
+    prompt = oauth.client.get(
+        "/oauth/authorize",
+        params=_authorization_params(
+            oauth.config,
+            scope="budget:read budget:refresh budget:config",
+        ),
+    )
+
+    assert prompt.status_code == 200
+    assert f"<li>{BUDGET_CONFIG_SCOPE}</li>" in prompt.text
+    approval = oauth.client.post(
+        "/oauth/authorize",
+        data={
+            "consent_token": _consent_token(prompt.text),
+            "owner_secret": OWNER_SECRET,
+            "action": "approve",
+        },
+        follow_redirects=False,
+    )
+    assert approval.status_code == 303
+    code = parse_qs(urlsplit(approval.headers["location"]).query)["code"][0]
+
+    exchange = _exchange(oauth, code)
+    assert exchange.status_code == 200
+    body = exchange.json()
+    assert body["scope"] == "budget:config budget:read budget:refresh"
+
+    verifier = DatabaseTokenVerifier(oauth.config, oauth.session_factory)
+    verified = asyncio.run(verifier.verify_token(str(body["access_token"])))
+    assert verified is not None
+    assert verified.scopes == ["budget:config", "budget:read", "budget:refresh"]
 
 
 def test_consent_csp_allows_the_validated_chatgpt_redirect(oauth: OAuthHarness) -> None:
@@ -348,7 +383,17 @@ def test_refresh_rotates_and_replay_revokes_entire_family(oauth: OAuthHarness) -
         assert family.compromise_detected_at is not None
 
 
-def test_refresh_scope_cannot_be_increased(oauth: OAuthHarness) -> None:
+@pytest.mark.parametrize(
+    "escalated_scope",
+    [
+        "budget:read budget:refresh",
+        "budget:read budget:config",
+    ],
+)
+def test_refresh_scope_cannot_be_increased(
+    oauth: OAuthHarness,
+    escalated_scope: str,
+) -> None:
     code = _authorize(oauth)
     initial_response = _exchange(oauth, code)
     initial = initial_response.json()
@@ -373,7 +418,7 @@ def test_refresh_scope_cannot_be_increased(oauth: OAuthHarness) -> None:
             "client_id": CHATGPT_STABLE_CLIENT_ID,
             "resource": oauth.config.resource,
             "refresh_token": narrowed.json()["refresh_token"],
-            "scope": "budget:read budget:refresh",
+            "scope": escalated_scope,
         },
     )
     assert escalation.status_code == 400

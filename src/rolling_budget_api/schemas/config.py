@@ -1,6 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -25,11 +25,6 @@ class ConfigPutRequest(BaseModel):
     timezone: str = Field(default="America/New_York", min_length=1, max_length=64)
     display_currency: str = Field(default="USD", pattern=r"^[A-Z]{3}$")
     aggregation_version: int = Field(default=1, ge=1)
-    scope_key: str = Field(default="personal", pattern=r"^[A-Za-z0-9._:-]{1,128}$")
-    account_ids: list[Annotated[str, Field(min_length=1, max_length=128)]] = Field(
-        min_length=1,
-        max_length=100,
-    )
     categories: list[CategoryConfigInput] = Field(min_length=1, max_length=100)
 
     @model_validator(mode="after")
@@ -37,8 +32,6 @@ class ConfigPutRequest(BaseModel):
         keys = [category.key for category in self.categories]
         if len(keys) != len(set(keys)):
             raise ValueError("category keys must be unique")
-        if len(self.account_ids) != len(set(self.account_ids)):
-            raise ValueError("account_ids must be unique")
         return self
 
 
@@ -55,8 +48,6 @@ class ConfigVersionView(BaseModel):
     timezone: str
     display_currency: str
     aggregation_version: int
-    scope_key: str
-    account_ids: list[str]
     config_hash: str
     requires_full_rebuild: bool
     created_at: datetime

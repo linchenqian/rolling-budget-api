@@ -7,7 +7,14 @@ from dataclasses import dataclass, field
 from typing import Protocol
 from urllib.parse import urlsplit, urlunsplit
 
-SUPPORTED_SCOPES = ("budget:read", "budget:refresh")
+BUDGET_READ_SCOPE = "budget:read"
+BUDGET_REFRESH_SCOPE = "budget:refresh"
+BUDGET_CONFIG_SCOPE = "budget:config"
+SUPPORTED_SCOPES = (
+    BUDGET_READ_SCOPE,
+    BUDGET_REFRESH_SCOPE,
+    BUDGET_CONFIG_SCOPE,
+)
 CHATGPT_STABLE_CLIENT_ID = "https://chatgpt.com/oauth/client.json"
 CHATGPT_STABLE_REDIRECT_URI = "https://chatgpt.com/connector_platform_oauth_redirect"
 _CALLBACK_CLIENT_RE = re.compile(

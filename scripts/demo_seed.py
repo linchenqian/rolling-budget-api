@@ -3,22 +3,19 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import sys
 import uuid
-from collections.abc import Iterable
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-
 API_BASE_URL = os.environ.get("DEMO_API_BASE_URL", "http://127.0.0.1:8080").rstrip("/")
 AS_OF = "2026-08-19"
-SCOPE_KEY = "demo-personal"
 ACCOUNT_ID = "demo-checking"
+
 
 def _request(
     method: str,
@@ -90,54 +87,19 @@ def _stored_transaction(
 ) -> dict[str, Any]:
     return {
         "account_id": ACCOUNT_ID,
-        "source_transaction_id": transaction_id,
-        "decision": "STORE",
-        "transaction_date": date,
+        "account_name": "Synthetic Demo Checking",
+        "source_id": transaction_id,
+        "date": date,
         "amount": amount,
         "currency": "USD",
-        "status": "PENDING" if pending else "POSTED",
-        "merchant_name": merchant,
-        "description": "Synthetic demo fixture only",
-        "category_keys": categories,
+        "categories": categories,
+        "pending": pending,
+        "pending_source_id": None,
+        "name": merchant,
+        "merchant": merchant,
         "refunded": refund != "0",
         "refund_amount": refund,
-        "supersedes_source_transaction_id": None,
     }
-
-
-def _skipped_transactions() -> list[dict[str, Any]]:
-    merchant_types = [
-        "Synthetic Electric Utility",
-        "Synthetic Fuel Station",
-        "Synthetic Pharmacy",
-        "Synthetic Hardware Store",
-        "Synthetic Transit Pass",
-        "Synthetic Clothing Store",
-        "Synthetic Insurance Payment",
-        "Synthetic Bank Transfer",
-    ]
-    transactions: list[dict[str, Any]] = []
-    for index in range(43):
-        day = 6 + (index % 14)
-        amount = f"{8 + ((index * 137) % 8800) / 100:.2f}"
-        transactions.append(
-            {
-                "account_id": ACCOUNT_ID,
-                "source_transaction_id": f"demo-skip-{index + 1:03d}",
-                "decision": "SKIP",
-                "transaction_date": f"2026-08-{day:02d}",
-                "amount": amount,
-                "currency": "USD",
-                "status": "POSTED",
-                "merchant_name": merchant_types[index % len(merchant_types)],
-                "description": "Synthetic transaction outside tracked categories",
-                "category_keys": [],
-                "refunded": False,
-                "refund_amount": "0",
-                "supersedes_source_transaction_id": None,
-            }
-        )
-    return transactions
 
 
 def _transactions() -> list[dict[str, Any]]:
@@ -273,18 +235,9 @@ def _transactions() -> list[dict[str, Any]]:
             ["entertainment"],
         ),
     ]
-    transactions = stored + _skipped_transactions()
-    if len(transactions) != 61:
-        raise AssertionError(f"Expected 61 synthetic transactions, got {len(transactions)}")
-    return transactions
-
-
-def _checksum_chain(checksums: Iterable[str]) -> str:
-    digest = hashlib.sha256()
-    for checksum in checksums:
-        digest.update(checksum.encode("ascii"))
-        digest.update(b"\n")
-    return digest.hexdigest()
+    if len(stored) != 18:
+        raise AssertionError(f"Expected 18 synthetic transactions, got {len(stored)}")
+    return stored
 
 
 def main() -> int:
@@ -293,16 +246,12 @@ def main() -> int:
     write_key = os.getenv("BUDGET_WRITE_API_KEY") or master_key
     read_key = os.getenv("BUDGET_READ_API_KEY") or master_key
     if not admin_key or not write_key or not read_key:
-        raise SystemExit(
-            "Set API_KEY, or configure all three BUDGET_*_API_KEY role-specific keys"
-        )
+        raise SystemExit("Set API_KEY, or configure all three BUDGET_*_API_KEY role-specific keys")
 
     config_payload = {
         "timezone": "America/New_York",
         "display_currency": "USD",
         "aggregation_version": 1,
-        "scope_key": SCOPE_KEY,
-        "account_ids": [ACCOUNT_ID],
         "categories": [
             _category(
                 key="restaurant",
@@ -357,18 +306,27 @@ def main() -> int:
             ),
         ],
     }
+    _current_status, current = _request("GET", "/v1/config", token=read_key)
+    editing_base = current.get("pending") or current.get("active")
+    config_headers = (
+        {"If-Match": str(editing_base["config_hash"])}
+        if isinstance(editing_base, dict)
+        else None
+    )
     config_status, config = _request(
-        "PUT", "/v1/config", token=admin_key, payload=config_payload
+        "PUT",
+        "/v1/config",
+        token=admin_key,
+        payload=config_payload,
+        headers=config_headers,
     )
 
     run_key = f"demo-full-{uuid.uuid4()}"
     begin_payload = {
         "mode": "FULL_REBUILD",
-        "scope_key": SCOPE_KEY,
         "source_from_date": "2026-07-01",
         "source_to_date": AS_OF,
         "expected_accounts": [ACCOUNT_ID],
-        "cursor_before": None,
     }
     begin_status, run = _request(
         "POST",
@@ -381,11 +339,8 @@ def main() -> int:
 
     transactions = _transactions()
     batches = [transactions[index : index + 25] for index in range(0, len(transactions), 25)]
-    batch_checksums: list[str] = []
-    store_count = 0
-    skip_count = 0
     for batch_index, batch in enumerate(batches):
-        batch_status, batch_result = _request(
+        batch_status, _batch_result = _request(
             "PUT",
             f"/v1/refresh-runs/{run_id}/batches/{batch_index}",
             token=write_key,
@@ -396,26 +351,10 @@ def main() -> int:
         )
         if batch_status != 200:
             raise RuntimeError(f"Unexpected batch status: {batch_status}")
-        batch_checksums.append(batch_result["checksum"])
-        store_count += int(batch_result["store_count"])
-        skip_count += int(batch_result["skip_count"])
 
     commit_payload = {
         "expected_batch_count": len(batches),
-        "expected_item_count": len(transactions),
-        "expected_store_count": store_count,
-        "expected_skip_count": skip_count,
-        "ordered_batch_checksum": _checksum_chain(batch_checksums),
-        "accounts": [
-            {
-                "account_id": ACCOUNT_ID,
-                "pages_complete": True,
-                "observed_count": len(transactions),
-                "source_reported_count": len(transactions),
-            }
-        ],
-        "cursor_after": {"demo_snapshot": AS_OF, "transaction_count": len(transactions)},
-        "source_complete": True,
+        "completed_accounts": [ACCOUNT_ID],
     }
     commit_status, receipt = _request(
         "POST",
@@ -425,9 +364,7 @@ def main() -> int:
     )
 
     query = urlencode({"as_of": AS_OF})
-    dashboard_status, dashboard = _request(
-        "GET", f"/v1/dashboard/budgets?{query}", token=read_key
-    )
+    dashboard_status, dashboard = _request("GET", f"/v1/dashboard/budgets?{query}", token=read_key)
     print(
         json.dumps(
             {
@@ -441,8 +378,6 @@ def main() -> int:
                 "uploaded": {
                     "batches": len(batches),
                     "items": len(transactions),
-                    "stored": store_count,
-                    "skipped": skip_count,
                 },
                 "categories": [
                     {

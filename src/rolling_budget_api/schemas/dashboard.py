@@ -30,7 +30,6 @@ class DashboardFreshness(BaseModel):
     status: str
     last_successful_refresh_at: datetime | None
     stale_after_hours: int
-    completeness: str
 
 
 class DashboardResponse(BaseModel):
