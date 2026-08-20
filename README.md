@@ -138,6 +138,7 @@ the credential is not embedded in the JavaScript bundle.
 | `STALE_AFTER_HOURS` | Age after which dashboard freshness is reported stale; default `36` |
 | `PUBLIC_BASE_URL` | Public HTTPS origin that enables ChatGPT OAuth and `/mcp`; omit to disable remote MCP |
 | `OAUTH_CONSENT_SECRET` | Optional owner-only consent password; defaults to `API_KEY`, and is required in role-key-only mode |
+| `OAUTH_FORM_ACTION_ORIGINS` | Comma-separated exact HTTPS OAuth callback origins; defaults to `https://chatgpt.com` |
 | `OAUTH_AUTHORIZATION_CODE_TTL_SECONDS` | Authorization-code lifetime; default `300` |
 | `OAUTH_ACCESS_TOKEN_TTL_SECONDS` | MCP access-token lifetime; default `900` |
 | `OAUTH_REFRESH_TOKEN_TTL_SECONDS` | Rotating refresh-token lifetime; default `7776000` |

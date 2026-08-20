@@ -161,6 +161,54 @@ def test_metadata_is_cimd_pkce_only_and_uses_exact_mcp_resource(oauth: OAuthHarn
     assert "registration_endpoint" not in metadata
 
 
+def test_consent_csp_allows_the_validated_chatgpt_redirect(oauth: OAuthHarness) -> None:
+    prompt = oauth.client.get(
+        "/oauth/authorize",
+        params=_authorization_params(oauth.config),
+    )
+
+    assert prompt.status_code == 200
+    csp = prompt.headers["content-security-policy"]
+    assert "form-action 'self' https://chatgpt.com" in csp
+    assert "https://chatgpt.com" not in csp.replace(
+        "form-action 'self' https://chatgpt.com",
+        "",
+    )
+
+
+def test_consent_csp_uses_configured_form_action_origins(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'custom-csp.db'}"
+    engine = get_engine(database_url)
+    Base.metadata.create_all(engine)
+    config = OAuthConfig(
+        public_base_url=PUBLIC_BASE_URL,
+        consent_secrets=(OWNER_SECRET,),
+        form_action_origins=(
+            "https://chatgpt.com",
+            "https://callbacks.example.com:8443",
+        ),
+    )
+    app = FastAPI()
+    app.include_router(
+        create_oauth_router(
+            config,
+            get_session_factory(database_url),
+            client_metadata_loader=_chatgpt_client_metadata,
+        )
+    )
+
+    prompt = TestClient(app).get(
+        "/oauth/authorize",
+        params=_authorization_params(config),
+    )
+
+    assert prompt.status_code == 200
+    assert (
+        "form-action 'self' https://chatgpt.com https://callbacks.example.com:8443"
+        in prompt.headers["content-security-policy"]
+    )
+
+
 def test_authorization_rejects_wrong_resource_and_non_chatgpt_redirect(
     oauth: OAuthHarness,
 ) -> None:

@@ -32,10 +32,6 @@ _SECURITY_HEADERS = {
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
-    "Content-Security-Policy": (
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
-        "frame-ancestors 'none'; base-uri 'none'"
-    ),
 }
 
 
@@ -98,7 +94,11 @@ def create_oauth_router(
                 )
             )
         consent_token = service.sign_consent(authorization)
-        return _consent_page(consent_token, authorization.scopes)
+        return _consent_page(
+            consent_token,
+            authorization.scopes,
+            form_action_origins=config.form_action_origins,
+        )
 
     @router.post("/oauth/authorize", include_in_schema=False)
     async def authorize_consent(request: Request) -> Response:
@@ -127,6 +127,7 @@ def create_oauth_router(
             return _consent_page(
                 consent_token,
                 authorization.scopes,
+                form_action_origins=config.form_action_origins,
                 error="The owner secret is invalid",
                 status_code=401,
             )
@@ -296,6 +297,7 @@ def _consent_page(
     consent_token: str,
     scopes: tuple[str, ...],
     *,
+    form_action_origins: tuple[str, ...],
     error: str | None = None,
     status_code: int = 200,
 ) -> HTMLResponse:
@@ -329,4 +331,13 @@ def _consent_page(
   </form>
 </body>
 </html>"""
-    return HTMLResponse(document, status_code=status_code, headers=_SECURITY_HEADERS)
+    form_action_sources = " ".join(form_action_origins)
+    security_headers = {
+        **_SECURITY_HEADERS,
+        "Content-Security-Policy": (
+            "default-src 'none'; style-src 'unsafe-inline'; "
+            f"form-action 'self' {form_action_sources}; "
+            "frame-ancestors 'none'; base-uri 'none'"
+        ),
+    }
+    return HTMLResponse(document, status_code=status_code, headers=security_headers)

@@ -102,6 +102,7 @@ No other environment variable is required. The image supplies these defaults:
 | `STALE_AFTER_HOURS` | `36` |
 | `MCP_MAX_REQUEST_BYTES` | `524288` |
 | `OAUTH_CONSENT_SECRET` | Uses `API_KEY` when empty; required in advanced role-key-only mode |
+| `OAUTH_FORM_ACTION_ORIGINS` | `https://chatgpt.com`; comma-separated exact HTTPS origins |
 | `OAUTH_AUTHORIZATION_CODE_TTL_SECONDS` | `300` |
 | `OAUTH_ACCESS_TOKEN_TTL_SECONDS` | `900` |
 | `OAUTH_REFRESH_TOKEN_TTL_SECONDS` | `7776000` |
