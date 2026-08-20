@@ -13,7 +13,8 @@ The image must be a release that explicitly includes all of the following:
 
 - SQLite storage at `/data/budget.db`
 - automatic database migrations before the API starts
-- a non-root runtime user with UID/GID `10001:10001`
+- a default root runtime that can initialize the ixVolume without extra
+  permission configuration
 - a built-in health check
 
 On the GitHub repository, publish a versioned release and wait for the
@@ -29,7 +30,7 @@ Tag:        <GUIDED_RELEASE_TAG>
 ```
 
 Replace `<GUIDED_RELEASE_TAG>` with the real fixed release tag, for example
-`0.2.0`. Do not type the placeholder into TrueNAS and do not use `latest`.
+`0.2.1`. Do not type the placeholder into TrueNAS and do not use `latest`.
 
 ## 2. Open the guided wizard
 
@@ -104,9 +105,13 @@ container port mapping and health check must use the same value.
 | --- | --- |
 | Privileged | Off |
 | Capabilities | None |
-| Custom User | On |
-| User ID | `10001` |
-| Group ID | `10001` |
+| Custom User | Off |
+
+Leave every other security-context override off. The image intentionally uses
+its default root runtime for the simplest ixVolume setup. Do not enable
+**Privileged**, add capabilities, mount host paths or TrueNAS system
+directories, or expose the Docker socket. The only storage mount for this path
+should be the dedicated ixVolume at `/data`.
 
 ### Network Configuration
 
@@ -145,13 +150,10 @@ Click **Add** and configure one volume:
 | Read Only | Off |
 | Mount Path | `/data` |
 | Dataset Name | `rolling-budget-data` |
-| Enable ACL | On |
-| ACL ID Type | USER |
-| ACL ID | `10001` |
-| ACL Access | Modify |
+| Enable ACL | Off |
 
-This ACL lets the non-root container create the SQLite database and its rollback
-journal in `/data`.
+No ownership or ACL entry needs to be added for this guided path. The container
+creates the SQLite database and its journal files directly in `/data`.
 
 ### Resources
 
@@ -169,8 +171,8 @@ curl --fail http://TRUENAS_LAN_IP:18080/health/ready
 ```
 
 If readiness fails, open the app's **Workloads → Logs** view. The most likely
-first-install causes are an image tag that does not exist, an ixVolume ACL that
-does not grant UID 10001 write access, or an invalid/missing `API_KEY`.
+first-install causes are an image tag that does not exist, storage that is not
+mounted at `/data`, or an invalid/missing `API_KEY`.
 
 The dashboard endpoint also requires initial category configuration. A
 `409 config_required` response from `/v1/dashboard/budgets` means networking,

@@ -66,3 +66,20 @@ jobs:
 
       - name: Build image
         run: docker build --tag rolling-budget-api:test .
+
+      - name: Verify default user and writable data volume
+        run: |
+          volume_name="rolling-budget-api-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker volume create "$volume_name"
+          trap 'docker volume rm "$volume_name"' EXIT
+
+          docker run --rm \
+            --mount "type=volume,source=$volume_name,target=/data" \
+            --entrypoint /bin/sh \
+            rolling-budget-api:test \
+            -eu -c '
+              test "$(id -u)" = "0"
+              test "$(stat -c "%u:%g:%a" /data)" = "0:0:755"
+              : > /data/write-test
+              test -w /data/write-test
+            '

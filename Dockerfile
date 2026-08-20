@@ -39,20 +39,20 @@ ENV APP_ENV=production \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-RUN groupadd --gid 10001 app \
-    && useradd --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app \
-    && mkdir -p /data \
-    && chown 10001:10001 /data
+RUN mkdir -p /data
 
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
-COPY --chown=10001:10001 alembic.ini ./
-COPY --chown=10001:10001 migrations ./migrations
-COPY --chown=10001:10001 scripts/container-entrypoint.sh ./container-entrypoint.sh
+COPY alembic.ini ./
+COPY migrations ./migrations
+COPY scripts/container-entrypoint.sh ./container-entrypoint.sh
 
 RUN chmod 0555 /app/container-entrypoint.sh
 
-USER 10001:10001
+# TrueNAS ixVolumes are created with root-owned default permissions. Running as
+# root keeps the Guided Custom App path usable without a custom user or ACL.
+# The deployment must remain unprivileged and mount only its dedicated /data volume.
+USER 0:0
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \

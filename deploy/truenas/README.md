@@ -22,16 +22,21 @@ decision:
 | Setting | Value |
 | --- | --- |
 | Image repository | `ghcr.io/YOUR_GITHUB_USERNAME/rolling-budget-api` |
-| Image tag | A fixed Guided App release tag, for example `0.2.0` |
+| Image tag | A fixed Guided App release tag, for example `0.2.1` |
 | Required environment variable | `API_KEY=<one long random secret>` |
 | Container/host port | `8000` → `18080/TCP` |
-| Container user/group | `10001:10001` |
-| Storage | One writable ixVolume mounted at `/data`, ACL user `10001` Modify |
+| Custom User | Off (use the image's default root runtime) |
+| Storage | One ixVolume mounted at `/data`, with Enable ACL off |
 | Public hostname | `budget.example.com` |
 
 All other environment settings have container defaults. In particular, the
 default database is `sqlite:////data/budget.db` and the default CORS policy is
 `*`. CORS can be narrowed later to the exact dashboard browser origin.
+
+Keep **Privileged** off and do not add capabilities. Mount only the dedicated
+ixVolume at `/data`; do not add host paths, TrueNAS system directories, or the
+Docker socket. These limits prevent the container from receiving broad host
+access and expose only its dedicated budget-data volume.
 
 After the app reports Running, verify it from the TrueNAS network:
 
