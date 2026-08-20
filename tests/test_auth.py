@@ -15,7 +15,7 @@ ADMIN_KEY = "synthetic-admin-key-at-least-32-characters"
 def _settings(**overrides: object) -> Settings:
     values: dict[str, object] = {"API_KEY": MASTER_KEY}
     values.update(overrides)
-    return Settings.model_validate(values)
+    return Settings(_env_file=None, **values)
 
 
 def _auth_app(settings: Settings | None = None) -> FastAPI:
@@ -102,7 +102,51 @@ def test_only_master_key_is_required_and_other_settings_have_defaults(
     assert settings.cors_allowed_origins == ["*"]
     assert settings.max_batch_items == 250
     assert settings.max_request_bytes == 262_144
+    assert settings.mcp_max_request_bytes == 524_288
     assert settings.stale_after_hours == 36
+    assert settings.public_base_url is None
+    assert settings.mcp_public_url is None
+
+
+def test_public_base_url_enables_a_canonical_mcp_resource() -> None:
+    settings = _settings(PUBLIC_BASE_URL="https://budget.example.com/")
+
+    assert settings.public_base_url == "https://budget.example.com"
+    assert settings.mcp_public_url == "https://budget.example.com/mcp"
+    assert settings.oauth_owner_secret == MASTER_KEY
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://budget.example.com",
+        "https://user:secret@budget.example.com",
+        "https://budget.example.com/prefix",
+        "https://budget.example.com?tenant=owner",
+    ],
+)
+def test_public_base_url_rejects_ambiguous_or_insecure_origins(url: str) -> None:
+    with pytest.raises(ValidationError, match="PUBLIC_BASE_URL"):
+        _settings(PUBLIC_BASE_URL=url)
+
+
+def test_remote_mcp_role_key_mode_requires_a_separate_consent_secret() -> None:
+    role_keys = {
+        "BUDGET_READ_API_KEY": READ_KEY,
+        "BUDGET_WRITE_API_KEY": WRITE_KEY,
+        "BUDGET_ADMIN_API_KEY": ADMIN_KEY,
+        "PUBLIC_BASE_URL": "https://budget.example.com",
+    }
+    with pytest.raises(ValidationError, match="OAUTH_CONSENT_SECRET"):
+        Settings(_env_file=None, API_KEY=None, **role_keys)
+
+    settings = Settings(
+        _env_file=None,
+        API_KEY=None,
+        **role_keys,
+        OAUTH_CONSENT_SECRET="synthetic-consent-secret-at-least-32-characters",
+    )
+    assert settings.oauth_owner_secret == "synthetic-consent-secret-at-least-32-characters"
 
 
 def test_legacy_three_role_key_configuration_remains_supported() -> None:

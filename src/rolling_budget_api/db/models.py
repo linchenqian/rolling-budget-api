@@ -708,3 +708,105 @@ class SyncState(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+
+
+class OAuthAuthorizationCode(Base):
+    __tablename__ = "oauth_authorization_codes"
+    __table_args__ = (
+        CheckConstraint("length(code_digest) = 64", name="code_digest_sha256"),
+        CheckConstraint("length(code_challenge) = 43", name="code_challenge_s256"),
+        CheckConstraint(
+            "length(credential_generation) = 64",
+            name="credential_generation_sha256",
+        ),
+        Index("ix_oauth_authorization_codes_expires_at", "expires_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    code_digest: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    client_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    redirect_uri: Mapped[str] = mapped_column(String(1024), nullable=False)
+    resource: Mapped[str] = mapped_column(String(1024), nullable=False)
+    scopes: Mapped[str] = mapped_column(Text, nullable=False)
+    code_challenge: Mapped[str] = mapped_column(String(43), nullable=False)
+    subject: Mapped[str] = mapped_column(String(128), nullable=False)
+    credential_generation: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OAuthTokenFamily(Base):
+    __tablename__ = "oauth_token_families"
+    __table_args__ = (
+        CheckConstraint(
+            "length(credential_generation) = 64",
+            name="credential_generation_sha256",
+        ),
+        Index("ix_oauth_token_families_expires_at", "expires_at"),
+        Index("ix_oauth_token_families_revoked_at", "revoked_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    client_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    resource: Mapped[str] = mapped_column(String(1024), nullable=False)
+    scopes: Mapped[str] = mapped_column(Text, nullable=False)
+    subject: Mapped[str] = mapped_column(String(128), nullable=False)
+    credential_generation: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    compromise_detected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+
+
+class OAuthAccessToken(Base):
+    __tablename__ = "oauth_access_tokens"
+    __table_args__ = (
+        CheckConstraint("length(token_digest) = 64", name="token_digest_sha256"),
+        Index("ix_oauth_access_tokens_expires_at", "expires_at"),
+        Index("ix_oauth_access_tokens_family_id", "family_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    token_digest: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    family_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("oauth_token_families.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    scopes: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OAuthRefreshToken(Base):
+    __tablename__ = "oauth_refresh_tokens"
+    __table_args__ = (
+        CheckConstraint("length(token_digest) = 64", name="token_digest_sha256"),
+        Index("ix_oauth_refresh_tokens_expires_at", "expires_at"),
+        Index("ix_oauth_refresh_tokens_family_id", "family_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    token_digest: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    family_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("oauth_token_families.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    scopes: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

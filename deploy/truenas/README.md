@@ -9,9 +9,9 @@ This path targets TrueNAS SCALE 24.10 or newer. TrueNAS documents the guided
 wizard under **Apps → Discover Apps → Custom App** in its
 [Custom Apps guide](https://apps.truenas.com/managing-apps/installing-custom-apps/).
 
-> Do not enter `latest` or the literal placeholder `<GUIDED_RELEASE_TAG>`.
-> Wait for the first release that explicitly includes Guided App/SQLite support,
-> then use that fixed release tag in TrueNAS.
+> Do not enter `latest`. Use the documented minor channel tag when you want
+> TrueNAS's built-in image update notification, or a fixed patch tag when you
+> prefer fully manual upgrades.
 
 ## Guided installation at a glance
 
@@ -22,8 +22,9 @@ decision:
 | Setting | Value |
 | --- | --- |
 | Image repository | `ghcr.io/YOUR_GITHUB_USERNAME/rolling-budget-api` |
-| Image tag | A fixed Guided App release tag, for example `0.2.1` |
+| Image tag | Minor update channel `0.3`, or a fixed patch release such as `0.3.0` |
 | Required environment variable | `API_KEY=<one long random secret>` |
+| ChatGPT MCP environment variable | `PUBLIC_BASE_URL=https://budget.example.com` |
 | Container/host port | `8000` → `18080/TCP` |
 | Custom User | Off (use the image's default root runtime) |
 | Storage | One ixVolume mounted at `/data`, with Enable ACL off |
@@ -49,7 +50,16 @@ Your public hostname requires a separate DNS record, TLS certificate, and revers
 proxy. The TrueNAS Portal field only creates a convenient link; it does not
 provision DNS, HTTPS, or a proxy. Proxy HTTPS traffic to
 `http://TRUENAS_LAN_IP:18080`, preserve the `Authorization` header and `OPTIONS`
-requests, and do not expose port 18080 directly to the internet.
+requests. For ChatGPT, also forward `/mcp`, `/.well-known/*`, and `/oauth/*`
+without caching, and keep the `Mcp-Protocol-Version` header. Do not expose port
+18080 directly to the internet.
+
+Keep **Check for Docker image updates** enabled in TrueNAS Apps settings. With
+the `0.3` channel, a later `0.3.x` release changes that tag's image digest and
+TrueNAS can show **Update Available**. Clicking Update pulls and redeploys the
+new image while keeping `/data`; take an independent ixVolume snapshot or
+backup first because a Custom App image-only update does not guarantee an
+automatic database rollback snapshot.
 
 ## ixVolume warning
 

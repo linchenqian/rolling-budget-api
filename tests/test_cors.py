@@ -12,7 +12,7 @@ ORIGIN = "https://kitchen.synthetic.test"
 def _settings(**overrides: object) -> Settings:
     values: dict[str, object] = {"API_KEY": MASTER_KEY}
     values.update(overrides)
-    return Settings.model_validate(values)
+    return Settings(_env_file=None, **values)
 
 
 def _preflight(client: TestClient, origin: str = ORIGIN):
@@ -39,7 +39,7 @@ def test_default_cors_allows_any_origin_and_all_api_headers() -> None:
     allowed_methods = {
         item.strip() for item in response.headers["access-control-allow-methods"].split(",")
     }
-    assert {"GET", "PUT", "POST"} <= allowed_methods
+    assert {"GET", "PUT", "POST", "DELETE"} <= allowed_methods
     allowed_headers = {
         item.strip().lower()
         for item in response.headers["access-control-allow-headers"].split(",")
@@ -49,6 +49,8 @@ def test_default_cors_allows_any_origin_and_all_api_headers() -> None:
         "content-type",
         "idempotency-key",
         "if-match",
+        "mcp-protocol-version",
+        "mcp-session-id",
         "x-request-id",
     } <= allowed_headers
 
@@ -67,7 +69,7 @@ def test_cors_exposes_etag_and_request_id_to_browser_clients() -> None:
         item.strip().lower()
         for item in response.headers["access-control-expose-headers"].split(",")
     }
-    assert {"etag", "x-request-id"} <= exposed
+    assert {"etag", "mcp-session-id", "x-request-id"} <= exposed
     assert response.headers["x-request-id"] == "synthetic-request-id"
 
 

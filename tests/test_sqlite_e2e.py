@@ -85,7 +85,7 @@ def test_fresh_sqlite_migration_creates_schema_and_integrity_triggers(
     with engine.connect() as connection:
         assert connection.scalar(text("PRAGMA foreign_keys")) == 1
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0001_initial"
+            "0002_oauth"
         )
 
     with TestClient(create_app()) as client:
