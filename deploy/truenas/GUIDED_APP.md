@@ -30,7 +30,7 @@ Tag:        0.3
 ```
 
 The `0.3` minor channel receives `0.3.x` image updates through TrueNAS's built-in
-Docker update check. Use a fixed patch tag such as `0.3.1` instead when automatic
+Docker update check. Use a fixed patch tag such as `0.3.2` instead when automatic
 update notifications are not wanted. Do not use `latest`.
 
 ## 2. Open the guided wizard
@@ -231,6 +231,14 @@ one-time OAuth link, enter `OAUTH_CONSENT_SECRET` when configured, otherwise
 enter `API_KEY`, only into the service's own HTTPS consent page. ChatGPT receives
 limited, revocable OAuth tokens instead. The container also needs outbound DNS
 and HTTPS access to `chatgpt.com` so it can validate ChatGPT's client metadata.
+
+The consent page may request `budget:read`, `budget:refresh`, and
+`budget:config`. The last scope allows ChatGPT to update categories or
+classification rules only after a direct user request; it does not expose the
+owner secret. After upgrading an existing installation that was linked with
+read/refresh only, reconnect the MCP integration and explicitly approve
+`budget:config`. Existing refresh tokens cannot add that permission, and no new
+TrueNAS environment variable is required.
 
 ## 6. Use TrueNAS image updates
 

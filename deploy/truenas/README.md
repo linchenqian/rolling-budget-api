@@ -22,7 +22,7 @@ decision:
 | Setting | Value |
 | --- | --- |
 | Image repository | `ghcr.io/YOUR_GITHUB_USERNAME/rolling-budget-api` |
-| Image tag | Minor update channel `0.3`, or a fixed patch release such as `0.3.1` |
+| Image tag | Minor update channel `0.3`, or a fixed patch release such as `0.3.2` |
 | Required environment variable | `API_KEY=<one long random secret>` |
 | ChatGPT MCP environment variable | `PUBLIC_BASE_URL=https://budget.example.com` |
 | Container/host port | `8000` → `18080/TCP` |
@@ -53,6 +53,12 @@ provision DNS, HTTPS, or a proxy. Proxy HTTPS traffic to
 requests. For ChatGPT, also forward `/mcp`, `/.well-known/*`, and `/oauth/*`
 without caching, and keep the `Mcp-Protocol-Version` header. Do not expose port
 18080 directly to the internet.
+
+The MCP consent can grant separate `budget:read`, `budget:refresh`, and
+`budget:config` permissions. After installing a release that adds configuration
+writes, reconnect an older ChatGPT integration to explicitly approve
+`budget:config`; an existing refresh token cannot add the new permission. This
+requires no additional TrueNAS environment variable.
 
 Keep **Check for Docker image updates** enabled in TrueNAS Apps settings. With
 the `0.3` channel, a later `0.3.x` release changes that tag's image digest and

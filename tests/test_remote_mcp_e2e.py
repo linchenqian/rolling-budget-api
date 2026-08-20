@@ -4,9 +4,11 @@ import base64
 import hashlib
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 from fastapi.testclient import TestClient
+from httpx import Response
 
 from rolling_budget_api.core.config import Settings
 from rolling_budget_api.db import Base
@@ -47,7 +49,11 @@ def remote_settings(tmp_path: Path) -> Iterator[Settings]:
         db_session._create_engine.cache_clear()
 
 
-def _authorization_code(settings: Settings) -> str:
+def _authorization_code(
+    settings: Settings,
+    *,
+    scopes: tuple[str, ...] = ("budget:read", "budget:refresh"),
+) -> str:
     oauth_config = OAuthConfig.from_settings(settings)
     service = OAuthService(
         oauth_config,
@@ -58,11 +64,32 @@ def _authorization_code(settings: Settings) -> str:
             client_id=CHATGPT_STABLE_CLIENT_ID,
             redirect_uri=CHATGPT_STABLE_REDIRECT_URI,
             resource=oauth_config.resource,
-            scopes=("budget:read", "budget:refresh"),
+            scopes=scopes,
             code_challenge=CODE_CHALLENGE,
             state="remote-mcp-e2e",
         )
     )
+
+
+def _config_payload() -> dict[str, object]:
+    return {
+        "timezone": "America/New_York",
+        "display_currency": "USD",
+        "aggregation_version": 1,
+        "categories": [
+            {
+                "key": "restaurant",
+                "name": "Restaurant",
+                "icon": "fork-knife",
+                "sort_order": 0,
+                "budget_limit": "100",
+                "budget_currency": "USD",
+                "lookback_days": 30,
+                "classification_instruction": "Meals and takeout",
+                "enabled": True,
+            }
+        ],
+    }
 
 
 def _mcp_request(
@@ -72,21 +99,24 @@ def _mcp_request(
     method: str,
     params: dict[str, object],
     bearer: str,
-):
-    return client.post(
-        "/mcp",
-        headers={
-            "Accept": "application/json, text/event-stream",
-            "Authorization": f"Bearer {bearer}",
-            "Content-Type": "application/json",
-            "MCP-Protocol-Version": "2025-11-25",
-        },
-        json={
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": method,
-            "params": params,
-        },
+) -> Response:
+    return cast(
+        Response,
+        client.post(
+            "/mcp",
+            headers={
+                "Accept": "application/json, text/event-stream",
+                "Authorization": f"Bearer {bearer}",
+                "Content-Type": "application/json",
+                "MCP-Protocol-Version": "2025-11-25",
+            },
+            json={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params,
+            },
+        ),
     )
 
 
@@ -141,9 +171,77 @@ def test_top_level_oauth_token_reaches_mcp_but_keys_stay_separate(
             "pending": None,
         }
 
-        static_key_attempt = _mcp_request(
+        old_token_write = _mcp_request(
             client,
             request_id=3,
+            method="tools/call",
+            params={
+                "name": "update_config",
+                "arguments": {
+                    "configuration": _config_payload(),
+                    "expected_config_hash": None,
+                },
+            },
+            bearer=access_token,
+        )
+        assert old_token_write.status_code == 200, old_token_write.text
+        old_token_result = old_token_write.json()["result"]
+        assert old_token_result["isError"] is True
+        assert 'scope="budget:config"' in old_token_result["_meta"][
+            "mcp/www_authenticate"
+        ][0]
+
+        config_token_response = client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "client_id": CHATGPT_STABLE_CLIENT_ID,
+                "redirect_uri": CHATGPT_STABLE_REDIRECT_URI,
+                "resource": oauth_config.resource,
+                "code": _authorization_code(
+                    remote_settings,
+                    scopes=("budget:config",),
+                ),
+                "code_verifier": CODE_VERIFIER,
+            },
+        )
+        assert config_token_response.status_code == 200, config_token_response.text
+        config_access_token = config_token_response.json()["access_token"]
+
+        created = _mcp_request(
+            client,
+            request_id=4,
+            method="tools/call",
+            params={
+                "name": "update_config",
+                "arguments": {
+                    "configuration": _config_payload(),
+                    "expected_config_hash": None,
+                },
+            },
+            bearer=config_access_token,
+        )
+        assert created.status_code == 200, created.text
+        created_content = created.json()["result"]["structuredContent"]
+        assert created_content["active"]["version"] == 1
+        assert created_content["active"]["requires_full_rebuild"] is True
+        assert created_content["pending"] is None
+
+        read_after_write = _mcp_request(
+            client,
+            request_id=5,
+            method="tools/call",
+            params={"name": "get_config", "arguments": {}},
+            bearer=access_token,
+        )
+        assert read_after_write.status_code == 200, read_after_write.text
+        assert read_after_write.json()["result"]["structuredContent"]["active"][
+            "categories"
+        ][0]["key"] == "restaurant"
+
+        static_key_attempt = _mcp_request(
+            client,
+            request_id=6,
             method="tools/call",
             params={"name": "get_config", "arguments": {}},
             bearer=MASTER_KEY,

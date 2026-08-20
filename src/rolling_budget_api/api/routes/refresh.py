@@ -63,6 +63,7 @@ def put_refresh_batch(
         batch_index,
         request,
         max_batch_items=settings.max_batch_items,
+        max_request_bytes=settings.max_request_bytes,
     )
 
 

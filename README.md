@@ -21,12 +21,26 @@ and database migration history should still be treated as pre-1.0 interfaces.
 - Refunds reduce the original transaction's budget impact.
 - A transaction may belong to multiple categories. Category totals can overlap;
   they must not be summed to produce an overall total.
-- Transactions classified as `SKIP` are used to prove refresh coverage but are
-  not retained in the live transaction table.
-- Normal refreshes are incremental. A classification, statistics, or account
-  scope rule change creates a new rule version and requires a full rebuild.
-- Stable source account IDs are part of the versioned configuration. A refresh
-  must cover exactly that account set; display labels are never identity keys.
+- Only transactions matching at least one configured category are uploaded.
+  Unmatched source transactions are omitted and never stored.
+- Normal refreshes are incremental. A classification or statistics rule change
+  creates a new rule version and requires a full rebuild.
+- When active is the editing base and rule semantics are unchanged, budget limit,
+  category name, icon, and display-order changes take effect immediately without
+  reclassifying transactions. If pending is the editing base, those edits remain
+  isolated with pending and become visible only when a successful full rebuild
+  activates the complete configuration atomically. Classification instructions,
+  lookback, enablement, category-set, timezone, currency, and aggregation changes
+  create a pending configuration.
+- The first configuration becomes active immediately, but the first transaction
+  sync is still a full rebuild because no live transaction set exists yet.
+- The service has one global user dataset. Configuration contains neither a
+  user/scope key nor a persistent configured-account list.
+- The uploader enumerates the connected accounts at the start of each run and
+  submits their stable source IDs. The service freezes that set for commit
+  validation. Optional account names are display labels only and never identity
+  keys. If the set differs from the previous committed run, a full rebuild is
+  required.
 - A full rebuild is staged and atomically activated. A failed rebuild leaves the
   previous rule version and live dashboard data intact.
 
@@ -50,36 +64,64 @@ configure a separate revocable read-only key.
 
 Setting `PUBLIC_BASE_URL` enables a Streamable HTTP MCP endpoint at `/mcp` for
 ChatGPT. The remote MCP uses OAuth authorization-code flow with PKCE and issues
-only `budget:read` and `budget:refresh` scopes; it never gives ChatGPT the
-master API key or permission to change configuration. OAuth credentials are
-opaque, stored only as keyed digests, and remain valid across container
-restarts. The owner approves the initial link on a private consent page using
-the master key or an optional separate `OAUTH_CONSENT_SECRET`. Deployments that
-use only role-specific API keys must configure the separate consent secret. The
+separate `budget:read`, `budget:refresh`, and `budget:config` scopes; it never
+gives ChatGPT the master API key. `budget:config` permits the guarded
+`update_config` tool, which requires a complete replacement configuration and
+the current pending-or-active `config_hash`. This public hash covers the complete
+editable snapshot, including budget and presentation fields, and changes after
+every successful edit. The tool is intended only for a user's direct settings
+request; transaction, merchant, account-label, and other financial-source
+content must never trigger it. OAuth credentials are opaque,
+stored only as keyed digests, and remain valid across container restarts. The
+owner approves the initial link on a private consent page using the master key
+or an optional separate `OAUTH_CONSENT_SECRET`. Deployments that use only
+role-specific API keys must configure the separate consent secret. The
 container needs outbound HTTPS access to `chatgpt.com` to validate ChatGPT's
 client metadata during authorization.
+
+Existing OAuth tokens keep their original scopes after an upgrade. A connection
+authorized only for read/refresh cannot use a refresh token to add
+`budget:config`; reconnect and approve the new scope explicitly before asking
+ChatGPT to change settings. No additional environment variable is required.
+
+The REST configuration API uses the same compare-and-set rule. Read
+`GET /v1/config`, use `pending` as the editing base when present and otherwise
+`active`, then send its `config_hash` in `If-Match` with the complete
+`PUT /v1/config` replacement. Only the first configuration omits `If-Match`.
+The hash covers every editable field, so even a budget-only change invalidates a
+stale writer.
 
 ## Refresh integrity protocol
 
 Large refreshes use three steps:
 
-1. Create a refresh run with its rule version, mode, scope, source manifest, and
+1. Create a refresh run with its rule version, mode, exact account-ID set, and
    idempotency key.
 2. Upload numbered, checksummed batches. Retrying the same batch is safe only
    when its idempotency key and body hash are unchanged.
-3. Complete the run. The service verifies contiguous batches, counts, checksums,
-   and scope before committing live rows and the source cursor in one database
-   transaction.
+3. Complete the run with the intended batch count and exact completed-account
+   set. The service verifies that every declared contiguous batch arrived, then
+   commits the staged rows and refresh revision in one database transaction.
 
 Incremental absence never deletes an existing transaction. Deletion requires an
-explicit `SKIP`/tombstone, or a complete full rebuild of the declared scope.
+explicit source-provided `pending_source_id` replacement, or a complete full
+rebuild of the single user's data.
 Database uniqueness constraints prevent duplicate runs, batches, transactions,
 and category assignments.
 
-The manifest proves that the API received and committed the uploader's declared
-payload. It cannot prove upstream account completeness unless the financial data
-source itself supplies a trustworthy cursor, item count, or equivalent coverage
-signal.
+The commit proves that the API received every batch and account completion the
+uploader declared. It cannot independently prove that the financial source
+returned every bank transaction; that responsibility remains at the source-reading
+boundary.
+
+Each uploaded transaction uses `account_id + source_id` as its stable identity.
+`account_name`, `name`, and `merchant` are optional display/classification data and
+never identity keys. `pending_source_id` is accepted only as an explicit source
+link from a posted transaction to its earlier pending identity; the service never
+guesses that link from amount, merchant, or date. A transaction's `categories`
+array may contain multiple configured category keys. Uploaded `amount` and
+`currency` must be normalized to the configuration's display currency; an
+approximate but consistent conversion is sufficient for this personal dashboard.
 
 ## Run locally with Docker Compose
 
@@ -111,10 +153,10 @@ do not add `--volumes` unless you deliberately intend to erase local data.
 ## End-to-end local demo
 
 The repository includes an API-backed dashboard prototype and a synthetic
-uploader that exercises the same config, batch, checksum, manifest, and commit
-flow intended for the AI uploader. The demo sends 61 transactions in three
-batches and covers multi-label classification, pending spending, a partial
-refund, and skipped transactions without using any real financial data.
+uploader that exercises the same config, staged-batch, completed-account, and
+atomic-commit flow intended for the AI uploader. The demo sends 18 matching
+transactions and covers multi-label classification, pending spending, and a
+partial refund without using any real financial data.
 
 See [`demo/dashboard/README.md`](demo/dashboard/README.md) for the isolated
 Compose project, uploader, and loopback-only preview instructions. The browser

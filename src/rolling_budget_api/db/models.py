@@ -93,16 +93,6 @@ class RefreshRunState(enum.StrEnum):
     FAILED = "failed"
 
 
-class StagedDecision(enum.StrEnum):
-    STORE = "store"
-    SKIP = "skip"
-
-
-class TransactionStatus(enum.StrEnum):
-    PENDING = "pending"
-    POSTED = "posted"
-
-
 def _enum_values(enum_class: type[enum.Enum]) -> list[str]:
     return [member.value for member in enum_class]
 
@@ -120,16 +110,6 @@ REFRESH_MODE = SAEnum(
 REFRESH_RUN_STATE = SAEnum(
     RefreshRunState,
     name="refresh_run_state",
-    values_callable=_enum_values,
-)
-STAGED_DECISION = SAEnum(
-    StagedDecision,
-    name="staged_decision",
-    values_callable=_enum_values,
-)
-TRANSACTION_STATUS = SAEnum(
-    TransactionStatus,
-    name="transaction_status",
     values_callable=_enum_values,
 )
 
@@ -276,12 +256,10 @@ class ConfigVersionRule(Base):
 class RefreshRun(Base):
     __tablename__ = "refresh_runs"
     __table_args__ = (
-        UniqueConstraint("id", "scope_key", name="uq_refresh_runs_id_scope"),
         UniqueConstraint(
             "id",
-            "scope_key",
             "config_version_id",
-            name="uq_refresh_runs_id_scope_config",
+            name="uq_refresh_runs_id_config",
         ),
         CheckConstraint(
             "source_from_date IS NULL OR source_to_date IS NULL "
@@ -292,35 +270,11 @@ class RefreshRun(Base):
             "expected_batch_count IS NULL OR expected_batch_count >= 0",
             name="expected_batch_count_nonnegative",
         ),
-        CheckConstraint(
-            "expected_source_count IS NULL OR expected_source_count >= 0",
-            name="expected_source_count_nonnegative",
-        ),
-        CheckConstraint(
-            "expected_store_count IS NULL OR expected_store_count >= 0",
-            name="expected_store_count_nonnegative",
-        ),
-        CheckConstraint(
-            "expected_skip_count IS NULL OR expected_skip_count >= 0",
-            name="expected_skip_count_nonnegative",
-        ),
         CheckConstraint("received_batch_count >= 0", name="received_batch_count_nonnegative"),
-        CheckConstraint("actual_source_count >= 0", name="actual_source_count_nonnegative"),
-        CheckConstraint("actual_store_count >= 0", name="actual_store_count_nonnegative"),
-        CheckConstraint("actual_skip_count >= 0", name="actual_skip_count_nonnegative"),
+        CheckConstraint("actual_item_count >= 0", name="actual_item_count_nonnegative"),
         CheckConstraint(
-            "actual_store_count + actual_skip_count = actual_source_count",
-            name="actual_counts_match",
-        ),
-        CheckConstraint(
-            "expected_source_count IS NULL OR expected_store_count IS NULL "
-            "OR expected_skip_count IS NULL "
-            "OR expected_store_count + expected_skip_count = expected_source_count",
-            name="expected_counts_match",
-        ),
-        CheckConstraint(
-            "input_checksum IS NULL OR length(input_checksum) = 64",
-            name="input_checksum_sha256",
+            "sync_revision_before IS NULL OR sync_revision_before >= 0",
+            name="sync_revision_before_nonnegative",
         ),
         CheckConstraint("length(request_hash) = 64", name="request_hash_sha256"),
         CheckConstraint(
@@ -333,25 +287,16 @@ class RefreshRun(Base):
         ),
         CheckConstraint(
             "state != 'committed' OR ("
-            "source_complete "
-            "AND expected_batch_count IS NOT NULL "
-            "AND expected_source_count IS NOT NULL "
-            "AND expected_store_count IS NOT NULL "
-            "AND expected_skip_count IS NOT NULL "
-            "AND input_checksum IS NOT NULL "
+            "expected_batch_count IS NOT NULL "
             "AND computed_checksum IS NOT NULL "
-            "AND input_checksum = computed_checksum "
             "AND expected_batch_count = received_batch_count "
-            "AND expected_source_count = actual_source_count "
-            "AND expected_store_count = actual_store_count "
-            "AND expected_skip_count = actual_skip_count "
-            "AND account_manifest IS NOT NULL "
+            "AND completed_accounts IS NOT NULL "
             "AND (expected_batch_count = 0 OR uploaded_at IS NOT NULL) "
             "AND validated_at IS NOT NULL "
             "AND committed_at IS NOT NULL)",
-            name="committed_manifest_complete",
+            name="committed_refresh_complete",
         ),
-        Index("ix_refresh_runs_scope_created", "scope_key", "created_at"),
+        Index("ix_refresh_runs_created", "created_at"),
         Index("ix_refresh_runs_state", "state"),
     )
 
@@ -369,7 +314,6 @@ class RefreshRun(Base):
         ForeignKey("config_versions.id", ondelete="RESTRICT"),
         nullable=False,
     )
-    scope_key: Mapped[str] = mapped_column(String(128), nullable=False)
     source_from_date: Mapped[date | None] = mapped_column(Date)
     source_to_date: Mapped[date | None] = mapped_column(Date)
     expected_accounts: Mapped[list[str]] = mapped_column(
@@ -378,20 +322,12 @@ class RefreshRun(Base):
         default=list,
         server_default=text("'[]'"),
     )
-    account_manifest: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON_DOCUMENT)
+    completed_accounts: Mapped[list[str] | None] = mapped_column(JSON_DOCUMENT)
     expected_batch_count: Mapped[int | None] = mapped_column(Integer)
-    expected_source_count: Mapped[int | None] = mapped_column(Integer)
-    expected_store_count: Mapped[int | None] = mapped_column(Integer)
-    expected_skip_count: Mapped[int | None] = mapped_column(Integer)
-    source_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    input_checksum: Mapped[str | None] = mapped_column(String(64))
     computed_checksum: Mapped[str | None] = mapped_column(String(64))
-    cursor_before: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT)
-    cursor_after: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT)
+    sync_revision_before: Mapped[int | None] = mapped_column(Integer)
     received_batch_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    actual_source_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    actual_store_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    actual_skip_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    actual_item_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -414,9 +350,6 @@ class RefreshBatch(Base):
         UniqueConstraint("run_id", "idempotency_key", name="uq_refresh_batches_run_idempotency"),
         CheckConstraint("batch_index >= 0", name="batch_index_nonnegative"),
         CheckConstraint("item_count >= 0", name="item_count_nonnegative"),
-        CheckConstraint("store_count >= 0", name="store_count_nonnegative"),
-        CheckConstraint("skip_count >= 0", name="skip_count_nonnegative"),
-        CheckConstraint("store_count + skip_count = item_count", name="item_count_matches"),
         CheckConstraint("length(request_hash) = 64", name="request_hash_sha256"),
         CheckConstraint("length(checksum) = 64", name="checksum_sha256"),
     )
@@ -429,8 +362,6 @@ class RefreshBatch(Base):
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     checksum: Mapped[str] = mapped_column(String(64), nullable=False)
     item_count: Mapped[int] = mapped_column(Integer, nullable=False)
-    store_count: Mapped[int] = mapped_column(Integer, nullable=False)
-    skip_count: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -443,27 +374,24 @@ class StagedTransaction(Base):
     __table_args__ = (
         PrimaryKeyConstraint(
             "run_id",
-            "scope_key",
             "account_id",
-            "source_transaction_id",
+            "source_id",
             name="pk_staged_transactions",
         ),
         UniqueConstraint(
             "run_id",
-            "scope_key",
             "account_id",
-            "source_transaction_id",
+            "source_id",
             "config_version_id",
             name="uq_staged_transactions_identity_config",
         ),
         ForeignKeyConstraint(
-            ["run_id", "scope_key", "config_version_id"],
+            ["run_id", "config_version_id"],
             [
                 "refresh_runs.id",
-                "refresh_runs.scope_key",
                 "refresh_runs.config_version_id",
             ],
-            name="fk_staged_transactions_run_scope_config",
+            name="fk_staged_transactions_run_config",
             ondelete="CASCADE",
         ),
         ForeignKeyConstraint(
@@ -473,42 +401,35 @@ class StagedTransaction(Base):
             ondelete="CASCADE",
         ),
         CheckConstraint("batch_index >= 0", name="batch_index_nonnegative"),
-        CheckConstraint("amount IS NULL OR amount >= 0", name="amount_nonnegative"),
+        CheckConstraint("amount >= 0", name="amount_nonnegative"),
         CheckConstraint("refund_amount >= 0", name="refund_amount_nonnegative"),
         CheckConstraint(
             "(NOT refunded AND refund_amount = 0) OR "
-            "(refunded AND amount IS NOT NULL AND refund_amount > 0 "
-            "AND refund_amount <= amount)",
+            "(refunded AND refund_amount > 0 AND refund_amount <= amount)",
             name="refund_consistent",
         ),
-        CheckConstraint(
-            "decision != 'store' OR "
-            "(transaction_date IS NOT NULL AND amount IS NOT NULL "
-            "AND currency IS NOT NULL AND status IS NOT NULL)",
-            name="stored_fields_present",
-        ),
+        CheckConstraint("pending IN (false, true)", name="pending_boolean"),
         CheckConstraint("length(source_hash) = 64", name="source_hash_sha256"),
         Index("ix_staged_transactions_run_batch", "run_id", "batch_index"),
     )
 
     run_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
-    scope_key: Mapped[str] = mapped_column(String(128), nullable=False)
     config_version_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
     account_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    source_transaction_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    account_name: Mapped[str | None] = mapped_column(String(255))
+    source_id: Mapped[str] = mapped_column(String(255), nullable=False)
     batch_index: Mapped[int] = mapped_column(Integer, nullable=False)
-    decision: Mapped[StagedDecision] = mapped_column(STAGED_DECISION, nullable=False)
-    transaction_date: Mapped[date | None] = mapped_column(Date)
-    amount: Mapped[Decimal | None] = mapped_column(Money())
-    currency: Mapped[str | None] = mapped_column(String(3))
-    status: Mapped[TransactionStatus | None] = mapped_column(TRANSACTION_STATUS)
+    transaction_date: Mapped[date] = mapped_column(Date, nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Money(), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    pending: Mapped[bool] = mapped_column(Boolean, nullable=False)
     merchant: Mapped[str | None] = mapped_column(String(500))
-    description: Mapped[str | None] = mapped_column(Text)
+    name: Mapped[str | None] = mapped_column(Text)
     refunded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     refund_amount: Mapped[Decimal] = mapped_column(
         Money(), nullable=False, default=Decimal("0")
     )
-    supersedes_source_transaction_id: Mapped[str | None] = mapped_column(String(255))
+    pending_source_id: Mapped[str | None] = mapped_column(String(255))
     source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
 
 
@@ -517,25 +438,22 @@ class StagedTransactionCategory(Base):
     __table_args__ = (
         PrimaryKeyConstraint(
             "run_id",
-            "scope_key",
             "account_id",
-            "source_transaction_id",
+            "source_id",
             "category_id",
             name="pk_staged_transaction_categories",
         ),
         ForeignKeyConstraint(
             [
                 "run_id",
-                "scope_key",
                 "account_id",
-                "source_transaction_id",
+                "source_id",
                 "config_version_id",
             ],
             [
                 "staged_transactions.run_id",
-                "staged_transactions.scope_key",
                 "staged_transactions.account_id",
-                "staged_transactions.source_transaction_id",
+                "staged_transactions.source_id",
                 "staged_transactions.config_version_id",
             ],
             name="fk_staged_transaction_categories_transaction",
@@ -554,10 +472,9 @@ class StagedTransactionCategory(Base):
     )
 
     run_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
-    scope_key: Mapped[str] = mapped_column(String(128), nullable=False)
     config_version_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
     account_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    source_transaction_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(255), nullable=False)
     category_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
     rule_version_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
 
@@ -566,32 +483,29 @@ class Transaction(Base):
     __tablename__ = "transactions"
     __table_args__ = (
         PrimaryKeyConstraint(
-            "scope_key",
             "account_id",
-            "source_transaction_id",
+            "source_id",
             name="pk_transactions",
         ),
         UniqueConstraint(
-            "scope_key",
             "account_id",
-            "source_transaction_id",
+            "source_id",
             "config_version_id",
             name="uq_transactions_identity_config",
         ),
         ForeignKeyConstraint(
-            ["first_refresh_run_id", "scope_key"],
-            ["refresh_runs.id", "refresh_runs.scope_key"],
-            name="fk_transactions_first_run_scope",
+            ["first_refresh_run_id"],
+            ["refresh_runs.id"],
+            name="fk_transactions_first_run",
             ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
-            ["last_refresh_run_id", "scope_key", "config_version_id"],
+            ["last_refresh_run_id", "config_version_id"],
             [
                 "refresh_runs.id",
-                "refresh_runs.scope_key",
                 "refresh_runs.config_version_id",
             ],
-            name="fk_transactions_last_run_scope_config",
+            name="fk_transactions_last_run_config",
             ondelete="RESTRICT",
         ),
         CheckConstraint("amount >= 0", name="amount_nonnegative"),
@@ -601,25 +515,26 @@ class Transaction(Base):
             "(refunded AND refund_amount > 0 AND refund_amount <= amount)",
             name="refund_consistent",
         ),
+        CheckConstraint("pending IN (false, true)", name="pending_boolean"),
         CheckConstraint("length(source_hash) = 64", name="source_hash_sha256"),
-        Index("ix_transactions_scope_date", "scope_key", "transaction_date"),
-        Index("ix_transactions_scope_status_date", "scope_key", "status", "transaction_date"),
+        Index("ix_transactions_date", "transaction_date"),
+        Index("ix_transactions_pending_date", "pending", "transaction_date"),
     )
 
-    scope_key: Mapped[str] = mapped_column(String(128), nullable=False)
     account_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    source_transaction_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    account_name: Mapped[str | None] = mapped_column(String(255))
+    source_id: Mapped[str] = mapped_column(String(255), nullable=False)
     transaction_date: Mapped[date] = mapped_column(Date, nullable=False)
     amount: Mapped[Decimal] = mapped_column(Money(), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
-    status: Mapped[TransactionStatus] = mapped_column(TRANSACTION_STATUS, nullable=False)
+    pending: Mapped[bool] = mapped_column(Boolean, nullable=False)
     merchant: Mapped[str | None] = mapped_column(String(500))
-    description: Mapped[str | None] = mapped_column(Text)
+    name: Mapped[str | None] = mapped_column(Text)
     refunded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     refund_amount: Mapped[Decimal] = mapped_column(
         Money(), nullable=False, default=Decimal("0")
     )
-    supersedes_source_transaction_id: Mapped[str | None] = mapped_column(String(255))
+    pending_source_id: Mapped[str | None] = mapped_column(String(255))
     source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     config_version_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
     first_refresh_run_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
@@ -636,23 +551,20 @@ class TransactionCategory(Base):
     __tablename__ = "transaction_categories"
     __table_args__ = (
         PrimaryKeyConstraint(
-            "scope_key",
             "account_id",
-            "source_transaction_id",
+            "source_id",
             "category_id",
             name="pk_transaction_categories",
         ),
         ForeignKeyConstraint(
             [
-                "scope_key",
                 "account_id",
-                "source_transaction_id",
+                "source_id",
                 "config_version_id",
             ],
             [
-                "transactions.scope_key",
                 "transactions.account_id",
-                "transactions.source_transaction_id",
+                "transactions.source_id",
                 "transactions.config_version_id",
             ],
             name="fk_transaction_categories_transaction",
@@ -671,9 +583,8 @@ class TransactionCategory(Base):
         Index("ix_transaction_categories_category", "category_id"),
     )
 
-    scope_key: Mapped[str] = mapped_column(String(128), nullable=False)
     account_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    source_transaction_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(255), nullable=False)
     category_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
     config_version_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
     rule_version_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
@@ -683,22 +594,24 @@ class SyncState(Base):
     __tablename__ = "sync_states"
     __table_args__ = (
         ForeignKeyConstraint(
-            ["last_refresh_run_id", "scope_key", "config_version_id"],
+            ["last_refresh_run_id", "config_version_id"],
             [
                 "refresh_runs.id",
-                "refresh_runs.scope_key",
                 "refresh_runs.config_version_id",
             ],
-            name="fk_sync_states_last_run_scope_config",
+            name="fk_sync_states_last_run_config",
             ondelete="RESTRICT",
         ),
+        CheckConstraint("id = 1", name="singleton"),
         CheckConstraint("revision >= 0", name="revision_nonnegative"),
-        CheckConstraint("length(cursor_hash) = 64", name="cursor_hash_sha256"),
     )
 
-    scope_key: Mapped[str] = mapped_column(String(128), primary_key=True)
-    cursor: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, nullable=False)
-    cursor_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        default=1,
+        server_default=text("1"),
+    )
     config_version_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
     last_refresh_run_id: Mapped[UUID] = mapped_column(Uuid, nullable=False, unique=True)
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

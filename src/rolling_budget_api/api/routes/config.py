@@ -12,8 +12,9 @@ router = APIRouter(prefix="/config", tags=["configuration"])
 @router.get("", response_model=ConfigView, dependencies=[Depends(require_read)])
 def read_config(response: Response, db: Session = Depends(get_db)) -> ConfigView:
     view = get_config(db)
-    if view.active is not None:
-        response.headers["ETag"] = f'"{view.active.config_hash}"'
+    base = view.pending or view.active
+    if base is not None:
+        response.headers["ETag"] = f'"{base.config_hash}"'
     return view
 
 
@@ -25,6 +26,7 @@ def replace_config(
     if_match: str | None = Header(default=None, alias="If-Match"),
 ) -> ConfigView:
     view = put_config(db, request, if_match=if_match)
-    if view.active is not None:
-        response.headers["ETag"] = f'"{view.active.config_hash}"'
+    base = view.pending or view.active
+    if base is not None:
+        response.headers["ETag"] = f'"{base.config_hash}"'
     return view

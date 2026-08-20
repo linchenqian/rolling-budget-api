@@ -28,9 +28,9 @@ python3 scripts/demo_seed.py
 ```
 
 The uploader uses the public API only. It creates five category rules, starts a
-full refresh, uploads 61 synthetic transactions in three checksummed batches,
-and commits the manifest. The dataset includes multi-label transactions,
-pending spending, a partial refund, and skipped transactions.
+full refresh, uploads 18 matching synthetic transactions in a checksummed batch,
+and commits the intended batch count plus completed-account set. The dataset
+includes multi-label transactions, pending spending, and a partial refund.
 
 Install and run the dashboard from this directory:
 

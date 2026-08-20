@@ -13,13 +13,11 @@ from .models import (
     RefreshRun,
     RefreshRunState,
     RuleVersion,
-    StagedDecision,
     StagedTransaction,
     StagedTransactionCategory,
     SyncState,
     Transaction,
     TransactionCategory,
-    TransactionStatus,
 )
 from .session import SessionLocal, get_db, get_engine, get_session_factory, session_scope
 
@@ -39,13 +37,11 @@ __all__ = [
     "RefreshRunState",
     "RuleVersion",
     "SessionLocal",
-    "StagedDecision",
     "StagedTransaction",
     "StagedTransactionCategory",
     "SyncState",
     "Transaction",
     "TransactionCategory",
-    "TransactionStatus",
     "get_db",
     "get_engine",
     "get_session_factory",

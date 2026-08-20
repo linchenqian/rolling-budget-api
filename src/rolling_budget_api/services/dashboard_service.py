@@ -12,14 +12,17 @@ from rolling_budget_api.db import (
     SyncState,
     Transaction,
     TransactionCategory,
-    TransactionStatus,
 )
 from rolling_budget_api.schemas.dashboard import (
     DashboardCategory,
     DashboardFreshness,
     DashboardResponse,
 )
-from rolling_budget_api.services.config_service import rules_for_config
+from rolling_budget_api.services.config_service import (
+    edit_hash_for_config,
+    lock_config_state,
+    rules_for_config,
+)
 from rolling_budget_api.services.errors import ConflictError
 
 
@@ -29,6 +32,7 @@ def get_dashboard(
     as_of: date | None,
     stale_after_hours: int,
 ) -> DashboardResponse:
+    lock_config_state(db, shared=True)
     active = db.scalar(
         select(ConfigVersion).where(ConfigVersion.status == ConfigVersionStatus.ACTIVE)
     )
@@ -41,7 +45,6 @@ def get_dashboard(
     )
     local_today = datetime.now(ZoneInfo(active.timezone)).date()
     window_end = as_of or local_today
-    scope_key = str(active.source_config.get("scope_key", "personal"))
 
     categories: list[DashboardCategory] = []
     for _link, rule, category in rules_for_config(db, active.id):
@@ -53,15 +56,10 @@ def get_dashboard(
                 select(Transaction)
                 .join(
                     TransactionCategory,
-                    (TransactionCategory.scope_key == Transaction.scope_key)
-                    & (TransactionCategory.account_id == Transaction.account_id)
-                    & (
-                        TransactionCategory.source_transaction_id
-                        == Transaction.source_transaction_id
-                    ),
+                    (TransactionCategory.account_id == Transaction.account_id)
+                    & (TransactionCategory.source_id == Transaction.source_id),
                 )
                 .where(
-                    Transaction.scope_key == scope_key,
                     Transaction.config_version_id == active.id,
                     TransactionCategory.category_id == category.id,
                     Transaction.transaction_date >= window_start,
@@ -70,7 +68,7 @@ def get_dashboard(
             )
         )
         spent = sum((item.amount - item.refund_amount for item in rows), Decimal("0"))
-        pending_rows = [item for item in rows if item.status == TransactionStatus.PENDING]
+        pending_rows = [item for item in rows if item.pending]
         pending_amount = sum(
             (item.amount - item.refund_amount for item in pending_rows), Decimal("0")
         )
@@ -112,39 +110,42 @@ def get_dashboard(
             )
         )
 
-    sync_state = db.get(SyncState, scope_key)
+    sync_state = db.get(SyncState, 1)
     last_refresh = sync_state.updated_at if sync_state is not None else None
     if last_refresh is None:
         freshness_status = "never_refreshed"
     else:
+        assert sync_state is not None
         if last_refresh.tzinfo is None:
             last_refresh = last_refresh.replace(tzinfo=UTC)
         age = datetime.now(UTC) - last_refresh
-        freshness_status = "stale" if age > timedelta(hours=stale_after_hours) else "fresh"
-    completeness = "none"
-    if sync_state is not None:
-        last_run = db.get(RefreshRun, sync_state.last_refresh_run_id)
-        manifests = last_run.account_manifest if last_run is not None else None
-        if manifests:
-            completeness = (
-                "source_reported"
-                if all(item.get("source_reported_count") is not None for item in manifests)
-                else "best_effort"
-            )
-
+        committed_run = db.get(RefreshRun, sync_state.last_refresh_run_id)
+        source_is_behind = (
+            committed_run is None
+            or committed_run.source_to_date is None
+            or committed_run.source_to_date < window_end
+        )
+        freshness_status = (
+            "stale"
+            if age > timedelta(hours=stale_after_hours) or source_is_behind
+            else "fresh"
+        )
     return DashboardResponse(
         as_of=window_end,
         timezone=active.timezone,
         display_currency=active.display_currency,
         config_version=active.version,
-        config_hash=active.config_hash,
+        config_hash=edit_hash_for_config(db, active),
         pending_config_version=(pending_config.version if pending_config is not None else None),
-        full_rebuild_required=pending_config is not None,
+        full_rebuild_required=(
+            pending_config is not None
+            or sync_state is None
+            or sync_state.config_version_id != active.id
+        ),
         freshness=DashboardFreshness(
             status=freshness_status,
             last_successful_refresh_at=last_refresh,
             stale_after_hours=stale_after_hours,
-            completeness=completeness,
         ),
         categories=categories,
     )

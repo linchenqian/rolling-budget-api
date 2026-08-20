@@ -92,11 +92,10 @@ def _seed_refresh_run(connection: Connection, config_id: UUID) -> UUID:
             """
             INSERT INTO refresh_runs
                 (id, idempotency_key, request_hash, mode, state, config_version_id,
-                 scope_key, source_complete, received_batch_count, actual_source_count,
-                 actual_store_count, actual_skip_count)
+                 received_batch_count, actual_item_count)
             VALUES
                 (:id, :idempotency_key, :request_hash, 'full', 'created', :config_id,
-                 'synthetic-personal', false, 0, 0, 0, 0)
+                 0, 0)
             """
         ),
         {
@@ -119,69 +118,52 @@ def test_rule_versions_are_immutable_in_the_database(db_connection: Connection) 
         )
 
 
-def test_refresh_batch_counts_must_match_at_the_database_boundary(
+def test_refresh_batch_item_count_cannot_be_negative_at_database_boundary(
     db_connection: Connection,
 ) -> None:
     _category_id, _rule_id, config_id = _seed_config_graph(db_connection)
     run_id = _seed_refresh_run(db_connection, config_id)
 
-    with pytest.raises(DBAPIError, match="item_count_matches"):
+    with pytest.raises(DBAPIError, match="item_count_nonnegative"):
         db_connection.execute(
             text(
                 """
                 INSERT INTO refresh_batches
-                    (run_id, batch_index, idempotency_key, request_hash, checksum,
-                     item_count, store_count, skip_count)
+                    (run_id, batch_index, idempotency_key, request_hash, checksum, item_count)
                 VALUES
-                    (:run_id, 0, 'synthetic-batch', :hash, :checksum, 3, 1, 1)
+                    (:run_id, 0, 'synthetic-batch', :hash, :checksum, -1)
                 """
             ),
             {"run_id": run_id, "hash": "d" * 64, "checksum": "e" * 64},
         )
 
 
-def test_skipped_transactions_cannot_receive_categories(
+def test_refresh_run_sync_revision_is_immutable(db_connection: Connection) -> None:
+    _category_id, _rule_id, config_id = _seed_config_graph(db_connection)
+    run_id = _seed_refresh_run(db_connection, config_id)
+
+    with pytest.raises(DBAPIError, match="identity/manifest is immutable"):
+        db_connection.execute(
+            text("UPDATE refresh_runs SET sync_revision_before = 1 WHERE id = :run_id"),
+            {"run_id": run_id},
+        )
+
+
+def test_staged_categories_require_a_parent_transaction(
     db_connection: Connection,
 ) -> None:
     category_id, rule_id, config_id = _seed_config_graph(db_connection)
     run_id = _seed_refresh_run(db_connection, config_id)
-    db_connection.execute(
-        text(
-            """
-            INSERT INTO refresh_batches
-                (run_id, batch_index, idempotency_key, request_hash, checksum,
-                 item_count, store_count, skip_count)
-            VALUES
-                (:run_id, 0, 'synthetic-skip-batch', :hash, :checksum, 1, 0, 1)
-            """
-        ),
-        {"run_id": run_id, "hash": "f" * 64, "checksum": "1" * 64},
-    )
-    db_connection.execute(
-        text(
-            """
-            INSERT INTO staged_transactions
-                (run_id, scope_key, config_version_id, account_id,
-                 source_transaction_id, batch_index, decision, refunded,
-                 refund_amount, source_hash)
-            VALUES
-                (:run_id, 'synthetic-personal', :config_id, 'synthetic-checking',
-                 'synthetic-skip-001', 0, 'skip', false, 0, :source_hash)
-            """
-        ),
-        {"run_id": run_id, "config_id": config_id, "source_hash": "2" * 64},
-    )
-
-    with pytest.raises(DBAPIError, match="only STORE staging rows may have categories"):
+    with pytest.raises(DBAPIError):
         db_connection.execute(
             text(
                 """
                 INSERT INTO staged_transaction_categories
-                    (run_id, scope_key, config_version_id, account_id,
-                     source_transaction_id, category_id, rule_version_id)
+                    (run_id, config_version_id, account_id,
+                     source_id, category_id, rule_version_id)
                 VALUES
-                    (:run_id, 'synthetic-personal', :config_id, 'synthetic-checking',
-                     'synthetic-skip-001', :category_id, :rule_id)
+                    (:run_id, :config_id, 'synthetic-checking',
+                     'missing-parent-001', :category_id, :rule_id)
                 """
             ),
             {

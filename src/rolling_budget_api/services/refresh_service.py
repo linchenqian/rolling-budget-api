@@ -1,6 +1,4 @@
-from collections import Counter
 from datetime import UTC, datetime, timedelta
-from typing import Any
 from uuid import UUID
 
 from sqlalchemy import delete, func, select
@@ -16,13 +14,11 @@ from rolling_budget_api.db import (
     RefreshRun,
     RefreshRunState,
     RuleVersion,
-    StagedDecision,
     StagedTransaction,
     StagedTransactionCategory,
     SyncState,
     Transaction,
     TransactionCategory,
-    TransactionStatus,
 )
 from rolling_budget_api.db.session import begin_write_transaction
 from rolling_budget_api.schemas.refresh import (
@@ -33,8 +29,17 @@ from rolling_budget_api.schemas.refresh import (
     RefreshCommitRequest,
     RefreshRunView,
 )
+from rolling_budget_api.services.config_service import (
+    apply_config_presentation,
+    lock_config_state,
+)
 from rolling_budget_api.services.errors import ConflictError, DomainError, NotFoundError
-from rolling_budget_api.services.hashing import checksum_chain, sha256_hex, stable_receipt
+from rolling_budget_api.services.hashing import (
+    canonical_json,
+    checksum_chain,
+    sha256_hex,
+    stable_receipt,
+)
 
 
 def _mode(value: str) -> RefreshMode:
@@ -78,6 +83,7 @@ def begin_refresh(
     max_request_bytes: int,
 ) -> RefreshBeginResponse:
     begin_write_transaction(db)
+    lock_config_state(db)
     request_hash = sha256_hex(request)
     existing = db.scalar(select(RefreshRun).where(RefreshRun.idempotency_key == idempotency_key))
     if existing is not None:
@@ -108,15 +114,16 @@ def begin_refresh(
             code="full_rebuild_required",
         )
     target = pending if mode == RefreshMode.FULL and pending is not None else active
-    configured_accounts = set(target.source_config.get("account_ids", []))
-    if configured_accounts and set(request.expected_accounts) != configured_accounts:
-        raise ConflictError(
-            "expected_accounts must exactly match the target configuration",
-            code="account_scope_mismatch",
-        )
     if mode == RefreshMode.FULL:
         rules = _rules_for_config(db, target.id)
-        max_lookback = max((rule.lookback_days for _link, rule, _category in rules), default=1)
+        max_lookback = max(
+            (
+                rule.lookback_days
+                for _link, rule, _category in rules
+                if rule.is_enabled
+            ),
+            default=1,
+        )
         required_start = request.source_to_date - timedelta(days=max_lookback - 1)
         if request.source_from_date > required_start:
             raise ConflictError(
@@ -124,25 +131,31 @@ def begin_refresh(
                 code="full_window_incomplete",
             )
 
-    sync_state = db.get(SyncState, request.scope_key)
-    current_cursor = sync_state.cursor if sync_state is not None else None
-    if mode == RefreshMode.INCREMENTAL and request.cursor_before != current_cursor:
+    sync_state = db.get(SyncState, 1)
+    if mode == RefreshMode.INCREMENTAL and sync_state is None:
         raise ConflictError(
-            "cursor_before does not match the last committed cursor",
-            code="cursor_conflict",
+            "The first successful refresh must be a complete FULL_REBUILD",
+            code="full_rebuild_required",
         )
-
+    if mode == RefreshMode.INCREMENTAL and sync_state is not None:
+        previous_run = db.get(RefreshRun, sync_state.last_refresh_run_id)
+        if previous_run is not None and set(previous_run.expected_accounts) != set(
+            request.expected_accounts
+        ):
+            raise ConflictError(
+                "The connected account set changed; retry with a complete FULL_REBUILD",
+                code="account_scope_changed",
+            )
     run = RefreshRun(
         idempotency_key=idempotency_key,
         request_hash=request_hash,
         mode=mode,
         state=RefreshRunState.CREATED,
         config_version_id=target.id,
-        scope_key=request.scope_key,
         source_from_date=request.source_from_date,
         source_to_date=request.source_to_date,
         expected_accounts=sorted(request.expected_accounts),
-        cursor_before=request.cursor_before,
+        sync_revision_before=(sync_state.revision if sync_state is not None else None),
     )
     db.add(run)
     db.commit()
@@ -167,7 +180,6 @@ def _begin_response(
     rules = [
         {
             "category_key": category.key,
-            "category_name": category.name,
             "lookback_days": rule.lookback_days,
             "classification_instruction": rule.classification_instruction,
             "enabled": rule.is_enabled,
@@ -195,6 +207,7 @@ def upload_batch(
     request: RefreshBatchRequest,
     *,
     max_batch_items: int,
+    max_request_bytes: int,
 ) -> RefreshBatchResponse:
     begin_write_transaction(db)
     if batch_index < 0:
@@ -202,6 +215,12 @@ def upload_batch(
     if len(request.transactions) > max_batch_items:
         raise DomainError(
             f"Batch contains more than {max_batch_items} transactions",
+            code="batch_too_large",
+            status_code=413,
+        )
+    if len(canonical_json(request)) > max_request_bytes:
+        raise DomainError(
+            f"Batch exceeds the {max_request_bytes}-byte request limit",
             code="batch_too_large",
             status_code=413,
         )
@@ -243,10 +262,14 @@ def upload_batch(
         for _link, rule, category in _rules_for_config(db, run.config_version_id)
         if rule.is_enabled
     }
+    config = db.get(ConfigVersion, run.config_version_id)
+    if config is None:  # protected by FK; defensive for damaged databases
+        raise ConflictError("Refresh configuration no longer exists", code="config_missing")
+    if run.source_from_date is None or run.source_to_date is None:
+        raise ConflictError("Refresh run has no source window", code="invalid_refresh_window")
     identities: set[tuple[str, str]] = set()
-    store_count = 0
     for item in request.transactions:
-        identity = (item.account_id, item.source_transaction_id)
+        identity = (item.account_id, item.source_id)
         if identity in identities:
             raise ConflictError(
                 "A transaction identity occurs more than once in the batch",
@@ -258,21 +281,31 @@ def upload_batch(
                 "Transaction account is not in expected_accounts",
                 code="unexpected_account",
             )
-        unknown = sorted(set(item.category_keys) - allowed.keys())
+        if item.currency != config.display_currency:
+            raise DomainError(
+                "Transaction currency must match the configured display currency",
+                code="currency_mismatch",
+            )
+        outside_window = item.date > run.source_to_date or (
+            run.mode == RefreshMode.FULL and item.date < run.source_from_date
+        )
+        if outside_window:
+            raise DomainError(
+                "Transaction date is outside the refresh source window",
+                code="transaction_outside_run_window",
+            )
+        unknown = sorted(set(item.categories) - allowed.keys())
         if unknown:
             raise DomainError(
                 f"Unknown or disabled categories: {', '.join(unknown)}",
                 code="unknown_category",
             )
-        staged_key = (run.id, run.scope_key, item.account_id, item.source_transaction_id)
+        staged_key = (run.id, item.account_id, item.source_id)
         if db.get(StagedTransaction, staged_key) is not None:
             raise ConflictError(
                 "A transaction identity was already uploaded in another batch",
                 code="duplicate_transaction",
             )
-        if item.decision == "STORE":
-            store_count += 1
-
     batch = RefreshBatch(
         run_id=run.id,
         batch_index=batch_index,
@@ -280,8 +313,6 @@ def upload_batch(
         request_hash=request_hash,
         checksum=checksum,
         item_count=len(request.transactions),
-        store_count=store_count,
-        skip_count=len(request.transactions) - store_count,
     )
     db.add(batch)
     db.flush()
@@ -289,44 +320,38 @@ def upload_batch(
     for item in request.transactions:
         staged = StagedTransaction(
             run_id=run.id,
-            scope_key=run.scope_key,
             config_version_id=run.config_version_id,
             account_id=item.account_id,
-            source_transaction_id=item.source_transaction_id,
+            account_name=item.account_name,
+            source_id=item.source_id,
             batch_index=batch_index,
-            decision=(StagedDecision.STORE if item.decision == "STORE" else StagedDecision.SKIP),
-            transaction_date=item.transaction_date,
+            transaction_date=item.date,
             amount=item.amount,
             currency=item.currency,
-            status=(
-                TransactionStatus.PENDING if item.status == "PENDING" else TransactionStatus.POSTED
-            ),
-            merchant=item.merchant_name,
-            description=item.description,
+            pending=item.pending,
+            pending_source_id=item.pending_source_id,
+            name=item.name,
+            merchant=item.merchant,
             refunded=item.refunded,
             refund_amount=item.refund_amount,
-            supersedes_source_transaction_id=item.supersedes_source_transaction_id,
             source_hash=sha256_hex(item),
         )
         db.add(staged)
-        for key in item.category_keys:
+        for key in item.categories:
             category_id, rule_version_id = allowed[key]
             db.add(
                 StagedTransactionCategory(
                     run_id=run.id,
-                    scope_key=run.scope_key,
                     config_version_id=run.config_version_id,
                     account_id=item.account_id,
-                    source_transaction_id=item.source_transaction_id,
+                    source_id=item.source_id,
                     category_id=category_id,
                     rule_version_id=rule_version_id,
                 )
             )
 
     run.received_batch_count += 1
-    run.actual_source_count += batch.item_count
-    run.actual_store_count += batch.store_count
-    run.actual_skip_count += batch.skip_count
+    run.actual_item_count += batch.item_count
     run.state = RefreshRunState.UPLOADED
     run.uploaded_at = datetime.now(UTC)
     db.commit()
@@ -337,10 +362,7 @@ def _batch_response(batch: RefreshBatch, *, replayed: bool) -> RefreshBatchRespo
     return RefreshBatchResponse(
         run_id=batch.run_id,
         batch_index=batch.batch_index,
-        checksum=batch.checksum,
         item_count=batch.item_count,
-        store_count=batch.store_count,
-        skip_count=batch.skip_count,
         replayed=replayed,
     )
 
@@ -351,38 +373,22 @@ def commit_refresh(
     request: RefreshCommitRequest,
 ) -> RefreshRunView:
     begin_write_transaction(db)
+    lock_config_state(db)
     run = db.scalar(select(RefreshRun).where(RefreshRun.id == run_id).with_for_update())
     if run is None:
         raise NotFoundError("Refresh run not found", code="refresh_run_not_found")
     if run.state == RefreshRunState.COMMITTED:
-        stored_accounts = sorted(run.account_manifest or [], key=lambda item: item["account_id"])
-        replay_accounts = sorted(
-            [item.model_dump(mode="json") for item in request.accounts],
-            key=lambda item: item["account_id"],
-        )
         same_commit = (
             run.expected_batch_count == request.expected_batch_count
-            and run.expected_source_count == request.expected_item_count
-            and run.expected_store_count == request.expected_store_count
-            and run.expected_skip_count == request.expected_skip_count
-            and run.input_checksum == request.ordered_batch_checksum
-            and run.cursor_after == request.cursor_after
-            and stored_accounts == replay_accounts
-            and request.source_complete
+            and sorted(run.completed_accounts or []) == request.completed_accounts
         )
         if not same_commit:
             raise ConflictError(
-                "Committed run was retried with a different manifest",
+                "Committed run was retried with different completion data",
                 code="commit_replay_conflict",
             )
         return _run_view(run)
-    empty_created_run = (
-        run.state == RefreshRunState.CREATED
-        and request.expected_batch_count == 0
-        and request.expected_item_count == 0
-        and request.expected_store_count == 0
-        and request.expected_skip_count == 0
-    )
+    empty_created_run = run.state == RefreshRunState.CREATED and request.expected_batch_count == 0
     if run.state != RefreshRunState.UPLOADED and not empty_created_run:
         raise ConflictError(
             f"Cannot commit a {run.state.value} refresh run",
@@ -404,6 +410,18 @@ def commit_refresh(
             "Incremental refresh target is no longer active",
             code="config_version_conflict",
         )
+    active, pending = _active_and_pending(db)
+    if run.mode == RefreshMode.INCREMENTAL and pending is not None:
+        raise ConflictError(
+            "A pending configuration was created after this refresh began",
+            code="full_rebuild_required",
+        )
+    current_target = pending if run.mode == RefreshMode.FULL and pending is not None else active
+    if current_target is None or current_target.id != config.id:
+        raise ConflictError(
+            "The target configuration changed after this refresh began",
+            code="config_version_conflict",
+        )
 
     batches = list(
         db.scalars(
@@ -416,112 +434,65 @@ def commit_refresh(
     if [batch.batch_index for batch in batches] != expected_indices:
         raise ConflictError("One or more upload batches are missing", code="missing_batch")
     computed_chain = checksum_chain(batch.checksum for batch in batches)
-    if computed_chain != request.ordered_batch_checksum:
-        raise ConflictError("Batch checksum chain does not match", code="checksum_mismatch")
 
-    totals = {
-        "items": sum(batch.item_count for batch in batches),
-        "store": sum(batch.store_count for batch in batches),
-        "skip": sum(batch.skip_count for batch in batches),
-    }
-    expected_totals = {
-        "items": request.expected_item_count,
-        "store": request.expected_store_count,
-        "skip": request.expected_skip_count,
-    }
-    if totals != expected_totals:
-        raise ConflictError("Manifest counts do not match uploaded batches", code="count_mismatch")
-    if (
-        run.actual_source_count != totals["items"]
-        or run.actual_store_count != totals["store"]
-        or run.actual_skip_count != totals["skip"]
-        or run.received_batch_count != len(batches)
-    ):
-        raise ConflictError("Stored run counters do not match batches", code="count_mismatch")
-
-    manifest_accounts = {item.account_id for item in request.accounts}
-    if manifest_accounts != set(run.expected_accounts):
+    item_count = sum(batch.item_count for batch in batches)
+    if request.completed_accounts != sorted(run.expected_accounts):
         raise ConflictError(
-            "Account manifest does not match expected_accounts",
-            code="account_manifest_mismatch",
+            "completed_accounts does not match expected_accounts",
+            code="completed_accounts_mismatch",
         )
-    staged_counts = Counter(
-        account_id
-        for account_id in db.scalars(
-            select(StagedTransaction.account_id).where(StagedTransaction.run_id == run.id)
+
+    sync_state = db.scalar(select(SyncState).where(SyncState.id == 1).with_for_update())
+    current_sync_revision = sync_state.revision if sync_state is not None else None
+    if current_sync_revision != run.sync_revision_before:
+        raise ConflictError(
+            "Another refresh committed after this run began",
+            code="refresh_run_superseded",
         )
-    )
-    for account in request.accounts:
-        if not account.pages_complete:
-            raise ConflictError(
-                f"Account {account.account_id} is missing one or more pages",
-                code="account_incomplete",
-            )
-        if staged_counts[account.account_id] != account.observed_count:
-            raise ConflictError(
-                f"Observed count does not match account {account.account_id}",
-                code="account_count_mismatch",
-            )
-        if (
-            account.source_reported_count is not None
-            and account.source_reported_count != account.observed_count
+    if run.mode == RefreshMode.INCREMENTAL:
+        previous_run = (
+            db.get(RefreshRun, sync_state.last_refresh_run_id) if sync_state is not None else None
+        )
+        if previous_run is None or set(previous_run.expected_accounts) != set(
+            run.expected_accounts
         ):
             raise ConflictError(
-                f"Source count does not match account {account.account_id}",
-                code="source_count_mismatch",
-            )
-    if not request.source_complete:
-        raise ConflictError("Source marked the refresh incomplete", code="source_incomplete")
-
-    sync_state = db.scalar(
-        select(SyncState).where(SyncState.scope_key == run.scope_key).with_for_update()
-    )
-    if run.mode == RefreshMode.INCREMENTAL:
-        committed_cursor = sync_state.cursor if sync_state is not None else None
-        if committed_cursor != run.cursor_before:
-            raise ConflictError(
-                "Another refresh advanced the cursor first",
-                code="cursor_conflict",
-            )
-    elif sync_state is not None:
-        previous_run = db.get(RefreshRun, sync_state.last_refresh_run_id)
-        if previous_run is not None and previous_run.created_at > run.created_at:
-            raise ConflictError(
-                "A newer refresh committed first",
-                code="refresh_run_superseded",
+                "The connected account set changed after this run began; retry with a complete "
+                "FULL_REBUILD",
+                code="account_scope_changed",
             )
 
     run.state = RefreshRunState.VALIDATED
     run.validated_at = datetime.now(UTC)
     run.uploaded_at = run.uploaded_at or run.validated_at
     run.expected_batch_count = request.expected_batch_count
-    run.expected_source_count = request.expected_item_count
-    run.expected_store_count = request.expected_store_count
-    run.expected_skip_count = request.expected_skip_count
-    run.source_complete = True
-    run.input_checksum = request.ordered_batch_checksum
+    run.received_batch_count = len(batches)
+    run.actual_item_count = item_count
     run.computed_checksum = computed_chain
-    run.cursor_after = request.cursor_after
-    run.account_manifest = [item.model_dump(mode="json") for item in request.accounts]
+    run.completed_accounts = request.completed_accounts
     # The database state-machine intentionally rejects UPLOADED -> COMMITTED jumps.
     # Flush VALIDATED as its own guarded transition while keeping the outer transaction open.
     db.flush()
 
+    replacement_targets = _validate_pending_replacements(db, run)
     if run.mode == RefreshMode.FULL:
-        _replace_scope(db, run)
+        _replace_all_transactions(db, run, replacement_targets=replacement_targets)
     else:
-        _merge_incremental(db, run)
+        _merge_incremental(db, run, replacement_targets=replacement_targets)
     _prune_outside_windows(db, run)
 
     now = datetime.now(UTC)
     # Mark the run committed while the outer transaction is still private. SQLite has no
-    # deferred constraint triggers, so config activation and cursor advancement validate
+    # deferred constraint triggers, so config activation and sync-state advancement validate
     # against this state in the steps below. A rollback still removes every change.
     run.state = RefreshRunState.COMMITTED
     run.committed_at = now
     db.flush()
 
     if config.status == ConfigVersionStatus.PENDING:
+        # Pending budget/presentation fields remain isolated from the active dashboard until
+        # the same transaction that publishes the rebuilt classifications activates them.
+        apply_config_presentation(db, config)
         old_active = db.scalar(
             select(ConfigVersion)
             .where(ConfigVersion.status == ConfigVersionStatus.ACTIVE)
@@ -537,20 +508,15 @@ def commit_refresh(
         config.activated_at = now
         db.flush()
 
-    next_cursor: dict[str, Any] = request.cursor_after or {}
     if sync_state is None:
         sync_state = SyncState(
-            scope_key=run.scope_key,
-            cursor=next_cursor,
-            cursor_hash=sha256_hex(next_cursor),
+            id=1,
             config_version_id=config.id,
             last_refresh_run_id=run.id,
             revision=1,
         )
         db.add(sync_state)
     else:
-        sync_state.cursor = next_cursor
-        sync_state.cursor_hash = sha256_hex(next_cursor)
         sync_state.config_version_id = config.id
         sync_state.last_refresh_run_id = run.id
         sync_state.revision += 1
@@ -566,57 +532,94 @@ def commit_refresh(
     return _run_view(run)
 
 
-def _replace_scope(db: Session, run: RefreshRun) -> None:
-    db.execute(delete(TransactionCategory).where(TransactionCategory.scope_key == run.scope_key))
-    db.execute(delete(Transaction).where(Transaction.scope_key == run.scope_key))
+def _validate_pending_replacements(
+    db: Session,
+    run: RefreshRun,
+) -> set[tuple[str, str]]:
+    staged_items = list(
+        db.scalars(select(StagedTransaction).where(StagedTransaction.run_id == run.id))
+    )
+    staged_by_identity = {
+        (staged.account_id, staged.source_id): staged for staged in staged_items
+    }
+    replacement_targets: set[tuple[str, str]] = set()
+    for staged in staged_items:
+        pending_source_id = staged.pending_source_id
+        if pending_source_id is None:
+            continue
+        target = (staged.account_id, pending_source_id)
+        if staged.pending or target == (staged.account_id, staged.source_id):
+            raise ConflictError(
+                "A pending replacement link is invalid",
+                code="pending_replacement_conflict",
+            )
+        if target in replacement_targets:
+            raise ConflictError(
+                "More than one transaction replaces the same pending transaction",
+                code="pending_replacement_conflict",
+            )
+        replacement_targets.add(target)
+
+        staged_target = staged_by_identity.get(target)
+        if staged_target is not None and not staged_target.pending:
+            raise ConflictError(
+                "A pending replacement link targets a non-pending staged transaction",
+                code="pending_replacement_conflict",
+            )
+        live_target = db.get(Transaction, target)
+        if live_target is not None and not live_target.pending:
+            raise ConflictError(
+                "A pending replacement link targets a non-pending live transaction",
+                code="pending_replacement_conflict",
+            )
+    return replacement_targets
+
+
+def _replace_all_transactions(
+    db: Session,
+    run: RefreshRun,
+    *,
+    replacement_targets: set[tuple[str, str]],
+) -> None:
+    db.execute(delete(TransactionCategory))
+    db.execute(delete(Transaction))
     db.flush()
-    for staged in db.scalars(
-        select(StagedTransaction).where(
-            StagedTransaction.run_id == run.id,
-            StagedTransaction.decision == StagedDecision.STORE,
-        )
-    ):
+    for staged in db.scalars(select(StagedTransaction).where(StagedTransaction.run_id == run.id)):
+        if (staged.account_id, staged.source_id) in replacement_targets:
+            continue
         _store_staged(db, run, staged, existing=None)
 
 
-def _merge_incremental(db: Session, run: RefreshRun) -> None:
+def _merge_incremental(
+    db: Session,
+    run: RefreshRun,
+    *,
+    replacement_targets: set[tuple[str, str]],
+) -> None:
     staged_items = list(
         db.scalars(select(StagedTransaction).where(StagedTransaction.run_id == run.id))
     )
     for staged in staged_items:
-        if staged.supersedes_source_transaction_id:
-            _delete_live_identity(
-                db,
-                run.scope_key,
-                staged.account_id,
-                staged.supersedes_source_transaction_id,
-            )
-        key = (run.scope_key, staged.account_id, staged.source_transaction_id)
-        existing = db.get(Transaction, key)
-        if staged.decision == StagedDecision.SKIP:
-            _delete_live_identity(
-                db,
-                run.scope_key,
-                staged.account_id,
-                staged.source_transaction_id,
-            )
+        if (staged.account_id, staged.source_id) in replacement_targets:
             continue
+        if staged.pending_source_id is not None:
+            _delete_live_identity(db, staged.account_id, staged.pending_source_id)
+        key = (staged.account_id, staged.source_id)
+        existing = db.get(Transaction, key)
         _store_staged(db, run, staged, existing=existing)
 
 
-def _delete_live_identity(db: Session, scope: str, account: str, source_id: str) -> None:
+def _delete_live_identity(db: Session, account: str, source_id: str) -> None:
     db.execute(
         delete(TransactionCategory).where(
-            TransactionCategory.scope_key == scope,
             TransactionCategory.account_id == account,
-            TransactionCategory.source_transaction_id == source_id,
+            TransactionCategory.source_id == source_id,
         )
     )
     db.execute(
         delete(Transaction).where(
-            Transaction.scope_key == scope,
             Transaction.account_id == account,
-            Transaction.source_transaction_id == source_id,
+            Transaction.source_id == source_id,
         )
     )
 
@@ -632,24 +635,24 @@ def _store_staged(
         staged.transaction_date is None
         or staged.amount is None
         or staged.currency is None
-        or staged.status is None
+        or staged.pending is None
     ):
-        raise ConflictError("STORE transaction is incomplete", code="invalid_staging_data")
+        raise ConflictError("Staged transaction is incomplete", code="invalid_staging_data")
     now = datetime.now(UTC)
     if existing is None:
         existing = Transaction(
-            scope_key=run.scope_key,
             account_id=staged.account_id,
-            source_transaction_id=staged.source_transaction_id,
+            account_name=staged.account_name,
+            source_id=staged.source_id,
             transaction_date=staged.transaction_date,
             amount=staged.amount,
             currency=staged.currency,
-            status=staged.status,
+            pending=staged.pending,
+            pending_source_id=staged.pending_source_id,
+            name=staged.name,
             merchant=staged.merchant,
-            description=staged.description,
             refunded=staged.refunded,
             refund_amount=staged.refund_amount,
-            supersedes_source_transaction_id=staged.supersedes_source_transaction_id,
             source_hash=staged.source_hash,
             config_version_id=run.config_version_id,
             first_refresh_run_id=run.id,
@@ -662,25 +665,24 @@ def _store_staged(
     else:
         _delete_live_identity(
             db,
-            run.scope_key,
             staged.account_id,
-            staged.source_transaction_id,
+            staged.source_id,
         )
         db.flush()
         # Preserve first-seen provenance across deterministic replacement.
         replacement = Transaction(
-            scope_key=run.scope_key,
             account_id=staged.account_id,
-            source_transaction_id=staged.source_transaction_id,
+            account_name=staged.account_name,
+            source_id=staged.source_id,
             transaction_date=staged.transaction_date,
             amount=staged.amount,
             currency=staged.currency,
-            status=staged.status,
+            pending=staged.pending,
+            pending_source_id=staged.pending_source_id,
+            name=staged.name,
             merchant=staged.merchant,
-            description=staged.description,
             refunded=staged.refunded,
             refund_amount=staged.refund_amount,
-            supersedes_source_transaction_id=staged.supersedes_source_transaction_id,
             source_hash=staged.source_hash,
             config_version_id=run.config_version_id,
             first_refresh_run_id=existing.first_refresh_run_id,
@@ -696,20 +698,18 @@ def _store_staged(
         db.scalars(
             select(StagedTransactionCategory).where(
                 StagedTransactionCategory.run_id == run.id,
-                StagedTransactionCategory.scope_key == run.scope_key,
                 StagedTransactionCategory.account_id == staged.account_id,
-                StagedTransactionCategory.source_transaction_id == staged.source_transaction_id,
+                StagedTransactionCategory.source_id == staged.source_id,
             )
         )
     )
     if not categories:
-        raise ConflictError("STORE transaction has no categories", code="invalid_staging_data")
+        raise ConflictError("Staged transaction has no categories", code="invalid_staging_data")
     for category in categories:
         db.add(
             TransactionCategory(
-                scope_key=run.scope_key,
                 account_id=staged.account_id,
-                source_transaction_id=staged.source_transaction_id,
+                source_id=staged.source_id,
                 category_id=category.category_id,
                 config_version_id=run.config_version_id,
                 rule_version_id=category.rule_version_id,
@@ -730,15 +730,10 @@ def _prune_outside_windows(db: Session, run: RefreshRun) -> None:
                 select(TransactionCategory)
                 .join(
                     Transaction,
-                    (Transaction.scope_key == TransactionCategory.scope_key)
-                    & (Transaction.account_id == TransactionCategory.account_id)
-                    & (
-                        Transaction.source_transaction_id
-                        == TransactionCategory.source_transaction_id
-                    ),
+                    (Transaction.account_id == TransactionCategory.account_id)
+                    & (Transaction.source_id == TransactionCategory.source_id),
                 )
                 .where(
-                    TransactionCategory.scope_key == run.scope_key,
                     TransactionCategory.category_id == category.id,
                     Transaction.transaction_date < cutoff,
                 )
@@ -748,15 +743,14 @@ def _prune_outside_windows(db: Session, run: RefreshRun) -> None:
             db.delete(link)
     db.flush()
 
-    live_items = list(db.scalars(select(Transaction).where(Transaction.scope_key == run.scope_key)))
+    live_items = list(db.scalars(select(Transaction)))
     for transaction in live_items:
         category_count = db.scalar(
             select(func.count())
             .select_from(TransactionCategory)
             .where(
-                TransactionCategory.scope_key == transaction.scope_key,
                 TransactionCategory.account_id == transaction.account_id,
-                TransactionCategory.source_transaction_id == transaction.source_transaction_id,
+                TransactionCategory.source_id == transaction.source_id,
             )
         )
         if not category_count:
@@ -780,10 +774,7 @@ def _run_view(run: RefreshRun) -> RefreshRunView:
         mode="FULL_REBUILD" if run.mode == RefreshMode.FULL else "INCREMENTAL",
         config_version_id=run.config_version_id,
         batch_count=run.received_batch_count,
-        item_count=run.actual_source_count,
-        store_count=run.actual_store_count,
-        skip_count=run.actual_skip_count,
-        input_checksum=run.input_checksum,
+        item_count=run.actual_item_count,
         receipt=receipt,
         created_at=run.created_at,
         committed_at=run.committed_at,
