@@ -30,7 +30,7 @@ Tag:        0.3
 ```
 
 The `0.3` minor channel receives `0.3.x` image updates through TrueNAS's built-in
-Docker update check. Use a fixed patch tag such as `0.3.2` instead when automatic
+Docker update check. Use a fixed patch tag such as `0.3.3` instead when automatic
 update notifications are not wanted. Do not use `latest`.
 
 ## 2. Open the guided wizard
@@ -247,6 +247,13 @@ configured `0.3` channel digest changes, the app can show **Update Available**.
 Clicking Update pulls the new image and recreates the container while retaining
 the `/data` mount. Keep the default pull policy; it does not need to be changed
 to Always.
+
+When updating a SQLite installation from `0.3.2` to `0.3.3`, startup repairs a
+released migration bug that could inflate existing category budgets by 10,000.
+If the bad scale is detected, the migration clears the derived transaction
+summary and marks the service as requiring a `FULL_REBUILD`; run one complete
+Rolling Budget refresh before relying on the dashboard again. Healthy databases
+are left unchanged.
 
 Before clicking Update, snapshot or back up the ixVolume. A Custom App
 image-only update does not guarantee the same automatic rollback snapshot as a

@@ -22,7 +22,7 @@ decision:
 | Setting | Value |
 | --- | --- |
 | Image repository | `ghcr.io/YOUR_GITHUB_USERNAME/rolling-budget-api` |
-| Image tag | Minor update channel `0.3`, or a fixed patch release such as `0.3.2` |
+| Image tag | Minor update channel `0.3`, or a fixed patch release such as `0.3.3` |
 | Required environment variable | `API_KEY=<one long random secret>` |
 | ChatGPT MCP environment variable | `PUBLIC_BASE_URL=https://budget.example.com` |
 | Container/host port | `8000` → `18080/TCP` |
@@ -66,6 +66,10 @@ TrueNAS can show **Update Available**. Clicking Update pulls and redeploys the
 new image while keeping `/data`; take an independent ixVolume snapshot or
 backup first because a Custom App image-only update does not guarantee an
 automatic database rollback snapshot.
+
+The `0.3.3` SQLite migration repairs category budgets affected by the `0.3.2`
+10,000x scale bug. A detected repair deliberately clears derived transactions
+and requires one new `FULL_REBUILD`; unaffected databases are not reset.
 
 ## ixVolume warning
 

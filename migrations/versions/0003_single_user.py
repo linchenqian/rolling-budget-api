@@ -37,7 +37,6 @@ _SCOPED_TABLES = (
     "sync_states",
 )
 _SQLITE_REBUILD_TABLES = (*_SCOPED_TABLES, "refresh_batches")
-_SQLITE_MONEY_FACTOR = 10_000
 
 
 def _json_value(value: object) -> Any:
@@ -896,15 +895,10 @@ def _sqlite_upgrade(
         bind.exec_driver_sql("DROP TRIGGER IF EXISTS trg_refresh_batches_immutable_delete")
         _sqlite_backup_and_drop(bind)
         _sqlite_execute_script(bind, _SQLITE_NEW_TABLES)
-        # Released SQLite 0002 databases stored money in human-unit NUMERIC
-        # values.  The current Money type stores four-decimal fixed-point values
-        # as BIGINT, so convert every retained value while the schema rebuild is
-        # atomic.  ROUND avoids truncating a value one unit low because SQLite
-        # may represent a legacy decimal as binary floating point internally.
-        bind.exec_driver_sql(
-            "UPDATE categories "
-            f"SET budget_limit = CAST(ROUND(budget_limit * {_SQLITE_MONEY_FACTOR}) AS INTEGER)"
-        )
+        # The released application already used the Money TypeDecorator on
+        # SQLite. Although the 0002 column was declared NUMERIC, application
+        # writes were already four-decimal fixed-point integers. Preserve the
+        # raw values while rebuilding the column as BIGINT.
         bind.exec_driver_sql(
             """INSERT INTO refresh_runs (
                 id, idempotency_key, request_hash, mode, state, config_version_id,
@@ -935,17 +929,17 @@ def _sqlite_upgrade(
             FROM _single_user_refresh_batches"""
         )
         bind.exec_driver_sql(
-            f"""INSERT INTO transactions (
+            """INSERT INTO transactions (
                 account_id, account_name, source_id, transaction_date, amount, currency, pending,
                 merchant, name, refunded, refund_amount, pending_source_id,
                 source_hash, config_version_id, first_refresh_run_id,
                 last_refresh_run_id, first_seen_at, last_seen_at
             )
             SELECT account_id, NULL, source_transaction_id, transaction_date,
-                   CAST(ROUND(amount * {_SQLITE_MONEY_FACTOR}) AS INTEGER), currency,
+                   amount, currency,
                    CASE WHEN status = 'pending' THEN 1 ELSE 0 END,
                    merchant, description, refunded,
-                   CAST(ROUND(refund_amount * {_SQLITE_MONEY_FACTOR}) AS INTEGER),
+                   refund_amount,
                    supersedes_source_transaction_id, source_hash, config_version_id,
                    first_refresh_run_id, last_refresh_run_id, first_seen_at, last_seen_at
             FROM _single_user_transactions"""
@@ -987,13 +981,8 @@ def _sqlite_downgrade(
         bind.exec_driver_sql("DROP TRIGGER IF EXISTS trg_refresh_batches_immutable_delete")
         _sqlite_backup_and_drop(bind)
         _sqlite_execute_script(bind, _SQLITE_OLD_TABLES)
-        # Restore the human-unit NUMERIC representation expected by 0002.  A
-        # real-valued divisor is intentional: SQLite otherwise performs integer
-        # division when both operands are integers.
-        bind.exec_driver_sql(
-            "UPDATE categories "
-            f"SET budget_limit = budget_limit / {_SQLITE_MONEY_FACTOR}.0"
-        )
+        # The 0002 runtime also used the Money TypeDecorator, so retain the same
+        # raw fixed-point integers in its NUMERIC-declared tables.
         bind.exec_driver_sql(
             """INSERT INTO refresh_runs (
                 id, idempotency_key, request_hash, mode, state, config_version_id,
@@ -1039,7 +1028,7 @@ def _sqlite_downgrade(
             FROM _single_user_refresh_batches"""
         )
         bind.exec_driver_sql(
-            f"""INSERT INTO staged_transactions (
+            """INSERT INTO staged_transactions (
                 run_id, scope_key, config_version_id, account_id,
                 source_transaction_id, batch_index, decision, transaction_date,
                 amount, currency, status, merchant, description, refunded,
@@ -1047,9 +1036,9 @@ def _sqlite_downgrade(
             )
             SELECT run_id, 'personal', config_version_id, account_id,
                    source_id, batch_index, 'store', transaction_date,
-                   amount / {_SQLITE_MONEY_FACTOR}.0, currency,
+                   amount, currency,
                    CASE WHEN pending THEN 'pending' ELSE 'posted' END,
-                   merchant, name, refunded, refund_amount / {_SQLITE_MONEY_FACTOR}.0,
+                   merchant, name, refunded, refund_amount,
                    pending_source_id, source_hash
             FROM _single_user_staged_transactions"""
         )
@@ -1063,7 +1052,7 @@ def _sqlite_downgrade(
             FROM _single_user_staged_transaction_categories"""
         )
         bind.exec_driver_sql(
-            f"""INSERT INTO transactions (
+            """INSERT INTO transactions (
                 scope_key, account_id, source_transaction_id, transaction_date,
                 amount, currency, status, merchant, description, refunded,
                 refund_amount, supersedes_source_transaction_id, source_hash,
@@ -1071,9 +1060,9 @@ def _sqlite_downgrade(
                 first_seen_at, last_seen_at
             )
             SELECT 'personal', account_id, source_id, transaction_date,
-                   amount / {_SQLITE_MONEY_FACTOR}.0, currency,
+                   amount, currency,
                    CASE WHEN pending THEN 'pending' ELSE 'posted' END,
-                   merchant, name, refunded, refund_amount / {_SQLITE_MONEY_FACTOR}.0,
+                   merchant, name, refunded, refund_amount,
                    pending_source_id, source_hash,
                    config_version_id, first_refresh_run_id, last_refresh_run_id,
                    first_seen_at, last_seen_at

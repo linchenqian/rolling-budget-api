@@ -31,6 +31,7 @@ from tests.test_refresh_dashboard_flow import (
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 MASTER_KEY = "sqlite-master-key-at-least-32-characters"
 SINGLE_USER_REVISION = "0003_single_user"
+CURRENT_REVISION = "0004_sqlite_money_scale_repair"
 LEGACY_SCOPE_TABLES = {
     "refresh_runs",
     "staged_transactions",
@@ -171,12 +172,15 @@ def _assert_legacy_money_storage(database_url: str) -> None:
             )
         ).mappings().one()
 
-    assert Decimal(str(category["budget_limit"])) == LEGACY_BUDGET
-    assert Decimal(str(live["amount"])) == LEGACY_AMOUNT
-    assert Decimal(str(live["refund_amount"])) == LEGACY_REFUND_AMOUNT
-    assert category["storage_type"] == "real"
-    assert live["amount_storage_type"] == "real"
-    assert live["refund_storage_type"] == "real"
+    # Released SQLite databases already used Money's fixed-point integer storage
+    # before the single-user migration.  A downgrade must not silently change the
+    # representation back to human-unit REAL values.
+    assert category["budget_limit"] == int(LEGACY_BUDGET * MONEY_FACTOR)
+    assert live["amount"] == int(LEGACY_AMOUNT * MONEY_FACTOR)
+    assert live["refund_amount"] == int(LEGACY_REFUND_AMOUNT * MONEY_FACTOR)
+    assert category["storage_type"] == "integer"
+    assert live["amount_storage_type"] == "integer"
+    assert live["refund_storage_type"] == "integer"
 
 
 def _seed_current_staged_money(database_url: str, identifiers: dict[str, str]) -> str:
@@ -286,10 +290,13 @@ def _seed_legacy_0002_database(database_url: str) -> dict[str, str]:
                 INSERT INTO categories
                     (id, key, name, sort_order, budget_limit, budget_currency)
                 VALUES
-                    (:id, 'restaurant', 'Restaurant', 0, 750.1250, 'USD')
+                    (:id, 'restaurant', 'Restaurant', 0, :budget_limit, 'USD')
                 """
             ),
-            {"id": identifiers["category"]},
+            {
+                "id": identifiers["category"],
+                "budget_limit": int(LEGACY_BUDGET * MONEY_FACTOR),
+            },
         )
         connection.execute(
             text(
@@ -398,11 +405,13 @@ def _seed_legacy_0002_database(database_url: str) -> dict[str, str]:
                      config_version_id, first_refresh_run_id, last_refresh_run_id)
                 VALUES
                     ('legacy-personal', 'legacy-checking', 'legacy-live-transaction',
-                     '2026-08-19', 25.1250, 'USD', 'posted', 1, 5.0625, :source_hash,
+                     '2026-08-19', :amount, 'USD', 'posted', 1, :refund_amount, :source_hash,
                      :config_id, :run_id, :run_id)
                 """
             ),
             {
+                "amount": int(LEGACY_AMOUNT * MONEY_FACTOR),
+                "refund_amount": int(LEGACY_REFUND_AMOUNT * MONEY_FACTOR),
                 "source_hash": "d" * 64,
                 "config_id": identifiers["config"],
                 "run_id": identifiers["committed_run"],
@@ -991,7 +1000,7 @@ def test_legacy_0002_upgrade_downgrade_and_reupgrade_preserve_single_user_data(
     assert sync_after_invalidated_commit == sync_before_invalidated_commit
     with db_session.get_engine(database_url).connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            SINGLE_USER_REVISION
+            CURRENT_REVISION
         )
 
     staged_run_id = _seed_current_staged_money(database_url, identifiers)
@@ -1019,13 +1028,18 @@ def test_legacy_0002_upgrade_downgrade_and_reupgrade_preserve_single_user_data(
 
         staged = connection.execute(
             text(
-                "SELECT amount, refund_amount FROM staged_transactions "
+                "SELECT amount, refund_amount, "
+                "typeof(amount) AS amount_storage_type, "
+                "typeof(refund_amount) AS refund_storage_type "
+                "FROM staged_transactions "
                 "WHERE run_id = :run_id AND source_transaction_id = 'current-staged-money'"
             ),
             {"run_id": staged_run_id},
         ).mappings().one()
-        assert Decimal(str(staged["amount"])) == CURRENT_STAGED_AMOUNT
-        assert Decimal(str(staged["refund_amount"])) == CURRENT_STAGED_REFUND_AMOUNT
+        assert staged["amount"] == int(CURRENT_STAGED_AMOUNT * MONEY_FACTOR)
+        assert staged["refund_amount"] == int(CURRENT_STAGED_REFUND_AMOUNT * MONEY_FACTOR)
+        assert staged["amount_storage_type"] == "integer"
+        assert staged["refund_storage_type"] == "integer"
 
     _clear_runtime_caches(database_url)
     command.upgrade(migration_config, "head")
@@ -1039,6 +1053,221 @@ def test_legacy_0002_upgrade_downgrade_and_reupgrade_preserve_single_user_data(
                 "WHERE source_id = 'current-staged-money'"
             )
         ) == 0
+
+
+def _prepare_revision_0003_database(
+    database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Config:
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("API_KEY", MASTER_KEY)
+    monkeypatch.delenv("BUDGET_READ_API_KEY", raising=False)
+    monkeypatch.delenv("BUDGET_WRITE_API_KEY", raising=False)
+    monkeypatch.delenv("BUDGET_ADMIN_API_KEY", raising=False)
+    _clear_runtime_caches(database_url)
+    migration_config = _migration_config(database_url)
+    command.upgrade(migration_config, SINGLE_USER_REVISION)
+    _clear_runtime_caches(database_url)
+    return migration_config
+
+
+def _live_transaction_snapshot(database_url: str) -> dict[str, object]:
+    with db_session.get_engine(database_url).connect() as connection:
+        transactions = [
+            dict(row)
+            for row in connection.execute(
+                text(
+                    "SELECT account_id, source_id, transaction_date, amount, currency, "
+                    "pending, refunded, refund_amount, pending_source_id, source_hash, "
+                    "config_version_id, first_refresh_run_id, last_refresh_run_id "
+                    "FROM transactions ORDER BY account_id, source_id"
+                )
+            ).mappings()
+        ]
+        category_links = [
+            dict(row)
+            for row in connection.execute(
+                text(
+                    "SELECT account_id, source_id, category_id, config_version_id, "
+                    "rule_version_id FROM transaction_categories "
+                    "ORDER BY account_id, source_id, category_id"
+                )
+            ).mappings()
+        ]
+        sync_state = connection.execute(
+            text(
+                "SELECT id, config_version_id, last_refresh_run_id, revision "
+                "FROM sync_states"
+            )
+        ).mappings().one_or_none()
+    return {
+        "transactions": transactions,
+        "category_links": category_links,
+        "sync_state": dict(sync_state) if sync_state is not None else None,
+    }
+
+
+def _create_config_and_committed_refresh() -> None:
+    with TestClient(create_app()) as client:
+        config = _create_config(client, restaurant_budget="750")
+        assert config["active"]["version"] == 1
+
+        run_id = _begin_refresh(client, key="post-0003-money-refresh")
+        _upload_transactions(client, run_id)
+        committed = client.post(
+            f"/v1/refresh-runs/{run_id}/commit",
+            headers=_headers("write"),
+            json=_commit_payload(),
+        )
+        assert committed.status_code == 200, committed.text
+        assert committed.json()["state"] == "COMMITTED"
+
+
+def test_money_scale_repair_corrects_only_proven_budgets_and_requires_full_rebuild(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'released-0003-double-scale.db'}"
+    migration_config = _prepare_revision_0003_database(database_url, monkeypatch)
+
+    with TestClient(create_app()) as client:
+        _create_config(client, restaurant_budget="750")
+
+    # Reproduce the released v0.3.2 state.  The active snapshot still says $750,
+    # while the faulty migration made the ORM/API observe $7,500,000.  The dating
+    # value simulates a legitimate later budget-only edit and must not be guessed at.
+    with db_session.get_engine(database_url).begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE categories SET budget_limit = :budget "
+                "WHERE key = 'restaurant'"
+            ),
+            {"budget": int(Decimal("750") * MONEY_FACTOR * MONEY_FACTOR)},
+        )
+        connection.execute(
+            text("UPDATE categories SET budget_limit = :budget WHERE key = 'dating'"),
+            {"budget": int(Decimal("90") * MONEY_FACTOR)},
+        )
+
+    with TestClient(create_app()) as client:
+        run_id = _begin_refresh(client, key="post-0003-money-refresh")
+        _upload_transactions(client, run_id)
+        committed = client.post(
+            f"/v1/refresh-runs/{run_id}/commit",
+            headers=_headers("write"),
+            json=_commit_payload(),
+        )
+        assert committed.status_code == 200, committed.text
+
+        before_config = client.get("/v1/config", headers=_headers("read"))
+        before_dashboard = client.get(
+            "/v1/dashboard/budgets?as_of=2026-08-19",
+            headers=_headers("read"),
+        )
+
+    assert before_config.status_code == 200, before_config.text
+    before_categories = {
+        item["key"]: item for item in before_config.json()["active"]["categories"]
+    }
+    assert Decimal(before_categories["restaurant"]["budget_limit"]) == Decimal("7500000")
+    assert Decimal(before_categories["dating"]["budget_limit"]) == Decimal("90")
+    assert before_dashboard.status_code == 200, before_dashboard.text
+    before_dashboard_categories = {
+        item["key"]: item for item in before_dashboard.json()["categories"]
+    }
+    assert Decimal(before_dashboard_categories["restaurant"]["spent"]) == Decimal("70")
+    assert _live_transaction_snapshot(database_url)["sync_state"] is not None
+
+    _clear_runtime_caches(database_url)
+    command.upgrade(migration_config, "head")
+    _clear_runtime_caches(database_url)
+
+    with db_session.get_engine(database_url).connect() as connection:
+        raw_budgets = dict(
+            connection.execute(
+                text("SELECT key, budget_limit FROM categories ORDER BY key")
+            ).all()
+        )
+        assert connection.scalar(text("SELECT count(*) FROM transactions")) == 0
+        assert connection.scalar(text("SELECT count(*) FROM transaction_categories")) == 0
+        assert connection.scalar(text("SELECT count(*) FROM sync_states")) == 0
+
+    assert raw_budgets["restaurant"] == int(Decimal("750") * MONEY_FACTOR)
+    assert raw_budgets["dating"] == int(Decimal("90") * MONEY_FACTOR)
+
+    with TestClient(create_app()) as client:
+        repaired_config = client.get("/v1/config", headers=_headers("read"))
+        repaired_dashboard = client.get(
+            "/v1/dashboard/budgets?as_of=2026-08-19",
+            headers=_headers("read"),
+        )
+
+    assert repaired_config.status_code == 200, repaired_config.text
+    repaired_categories = {
+        item["key"]: item for item in repaired_config.json()["active"]["categories"]
+    }
+    assert Decimal(repaired_categories["restaurant"]["budget_limit"]) == Decimal("750")
+    assert Decimal(repaired_categories["dating"]["budget_limit"]) == Decimal("90")
+    assert repaired_config.json()["active"]["requires_full_rebuild"] is True
+
+    assert repaired_dashboard.status_code == 200, repaired_dashboard.text
+    dashboard_body = repaired_dashboard.json()
+    assert dashboard_body["full_rebuild_required"] is True
+    assert dashboard_body["freshness"]["status"] == "never_refreshed"
+    assert all(Decimal(item["spent"]) == 0 for item in dashboard_body["categories"])
+
+
+def test_money_scale_repair_is_noop_for_healthy_0003_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'healthy-0003-money.db'}"
+    migration_config = _prepare_revision_0003_database(database_url, monkeypatch)
+    _create_config_and_committed_refresh()
+
+    with db_session.get_engine(database_url).connect() as connection:
+        budgets_before = dict(
+            connection.execute(
+                text("SELECT key, budget_limit FROM categories ORDER BY key")
+            ).all()
+        )
+    live_before = _live_transaction_snapshot(database_url)
+    assert live_before["transactions"]
+    assert live_before["category_links"]
+    assert live_before["sync_state"] is not None
+
+    _clear_runtime_caches(database_url)
+    command.upgrade(migration_config, "head")
+    _clear_runtime_caches(database_url)
+
+    with db_session.get_engine(database_url).connect() as connection:
+        budgets_after = dict(
+            connection.execute(
+                text("SELECT key, budget_limit FROM categories ORDER BY key")
+            ).all()
+        )
+    assert budgets_after == budgets_before
+    assert _live_transaction_snapshot(database_url) == live_before
+
+    with TestClient(create_app()) as client:
+        config = client.get("/v1/config", headers=_headers("read"))
+        dashboard = client.get(
+            "/v1/dashboard/budgets?as_of=2026-08-19",
+            headers=_headers("read"),
+        )
+
+    assert config.status_code == 200, config.text
+    categories = {item["key"]: item for item in config.json()["active"]["categories"]}
+    assert Decimal(categories["restaurant"]["budget_limit"]) == Decimal("750")
+    assert Decimal(categories["dating"]["budget_limit"]) == Decimal("80")
+    assert config.json()["active"]["requires_full_rebuild"] is False
+
+    assert dashboard.status_code == 200, dashboard.text
+    dashboard_body = dashboard.json()
+    dashboard_categories = {item["key"]: item for item in dashboard_body["categories"]}
+    assert Decimal(dashboard_categories["restaurant"]["spent"]) == Decimal("70")
+    assert dashboard_body["full_rebuild_required"] is False
+    assert dashboard_body["freshness"]["status"] == "fresh"
 
 
 @pytest.fixture
@@ -1085,7 +1314,7 @@ def test_fresh_sqlite_migration_creates_schema_and_integrity_triggers(
     with engine.connect() as connection:
         assert connection.scalar(text("PRAGMA foreign_keys")) == 1
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            SINGLE_USER_REVISION
+            CURRENT_REVISION
         )
 
     with TestClient(create_app()) as client:
